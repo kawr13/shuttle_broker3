@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     COMMAND_QUEUE_MAX_SIZE: int = int(os.getenv('COMMAND_QUEUE_MAX_SIZE', '1000'))
     COMMAND_PROCESSOR_WORKERS: int = int(os.getenv('COMMAND_PROCESSOR_WORKERS', '1'))
 
+    WMS_WEBHOOK_URL: str = os.getenv('WMS_WEBHOOK_URL', '')
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra='ignore')
 
 

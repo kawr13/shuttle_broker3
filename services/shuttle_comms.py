@@ -1,14 +1,18 @@
 import asyncio
 import time
 from typing import Optional
-import re
+
+import aiohttp
+
 from core.config import settings
 from core.logging_config import logger
-from crud.shuttle_crud import get_shuttle_state_crud, update_shuttle_state_crud
+from crud.shuttle_crud import update_shuttle_state_crud
 from models.shuttle import ShuttleOperationalStatus, ShuttleCommand
-from services.services import ACTIVE_SHUTTLE_CONNECTIONS, SHUTTLE_BATTERY_LEVEL, SHUTTLE_MESSAGES_RECEIVED_TOTAL, SHUTTLE_ERRORS_TOTAL
+from services.services import ACTIVE_SHUTTLE_CONNECTIONS, SHUTTLE_BATTERY_LEVEL, SHUTTLE_MESSAGES_RECEIVED_TOTAL, \
+    SHUTTLE_ERRORS_TOTAL
 
 SHUTTLE_TIMEOUT_SECONDS = 30  # Таймаут для зависших шаттлов
+WMS_WEBHOOK_URL = settings.WMS_WEBHOOK_URL
 
 async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optional[str] = None) -> bool:
     shuttle_config = settings.SHUTTLES_CONFIG.get(shuttle_id)
@@ -52,6 +56,30 @@ async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optiona
         logger.error(f"Неизвестная ошибка при отправке команды шаттлу {shuttle_id}: {e}")
         await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR, "error_code": "UNKNOWN_SEND_ERROR"})
     return False
+
+
+async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_code: Optional[str] = None):
+    if not WMS_WEBHOOK_URL or not WMS_WEBHOOK_URL.strip():
+        logger.warning("WMS_WEBHOOK_URL не настроен или пуст. Пропуск отправки в WMS.")
+        return
+
+    payload = {
+        "shuttle_id": shuttle_id,
+        "message": message,
+        "status": status,
+        "error_code": error_code,
+        "timestamp": time.time()
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(WMS_WEBHOOK_URL, json=payload) as response:
+                if response.status == 200:
+                    logger.info(f"Успешно отправлено в WMS для {shuttle_id}: {message}")
+                else:
+                    logger.error(f"Ошибка отправки в WMS: {response.status} {await response.text()}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке Webhook в WMS: {e}, данные: {payload}")
+
 
 async def process_shuttle_message_internal(shuttle_id: str, message: str):
     updates = {"last_message_sent_to_wms": message, "last_seen": time.time()}
@@ -104,6 +132,14 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
         updates["error_code"] = message
         updates["status"] = ShuttleOperationalStatus.ERROR
         SHUTTLE_ERRORS_TOTAL.labels(shuttle_id=shuttle_id, f_code=message).inc()
+
+    if WMS_WEBHOOK_URL and WMS_WEBHOOK_URL.strip():
+        asyncio.create_task(send_to_wms_webhook(
+            shuttle_id,
+            message,
+            updates.get("status", "UNKNOWN"),
+            updates.get("error_code")
+        ))
 
     await update_shuttle_state_crud(shuttle_id, updates)
     logger.debug(f"Обработано сообщение от {shuttle_id}: {message}, обновления: {updates}")
