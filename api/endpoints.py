@@ -14,9 +14,19 @@ router = APIRouter()
 
 # Маппинг склада (nameStockERP) на shuttle_id
 STOCK_TO_SHUTTLE = {
-    "Главный": "virtual_shuttle_1",
-    # Добавьте другие маппинги по необходимости
+    "Главный": ["virtual_shuttle_1", "virtual_shuttle_2"],
+    "Второй склад": ["shuttle_3"]
 }
+
+
+# Функция для поиска свободного шаттла
+async def get_free_shuttle(stock_name: str) -> str | None:
+    shuttles = STOCK_TO_SHUTTLE.get(stock_name, [])
+    for shuttle_id in shuttles:
+        state = await get_shuttle_state_crud(shuttle_id)  # Предполагаем, что есть такая функция
+        if state and state.status == "FREE":
+            return shuttle_id
+    return None
 
 
 @router.post("/command", summary="Send commands to shuttles")
@@ -27,10 +37,15 @@ async def send_command(payload: WMSCommandPayload):
     queued_commands = []
     for placement in payload.placement:
         # Определяем shuttle_id по nameStockERP
-        shuttle_id = STOCK_TO_SHUTTLE.get(placement.nameStockERP)
+        # shuttle_id = STOCK_TO_SHUTTLE.get(placement.nameStockERP)
+        stock_name = placement.nameStockERP
+        shuttle_id = await get_free_shuttle(stock_name)
         if not shuttle_id:
-            logger.error(f"Unknown stock: {placement.nameStockERP}")
-            raise HTTPException(status_code=400, detail=f"Unknown stock: {placement.nameStockERP}")
+            raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
+
+        # if not shuttle_id:
+        #     logger.error(f"Unknown stock: {placement.nameStockERP}")
+        #     raise HTTPException(status_code=400, detail=f"Unknown stock: {placement.nameStockERP}")
         if shuttle_id not in settings.SHUTTLES_CONFIG:
             logger.error(f"Shuttle not found: {shuttle_id}")
             raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
