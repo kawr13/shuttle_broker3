@@ -3,6 +3,7 @@ import time
 from typing import Optional
 
 import aiohttp
+from attrs import define
 
 from core.config import settings
 from core.logging_config import logger
@@ -11,8 +12,15 @@ from models.shuttle import ShuttleOperationalStatus, ShuttleCommand
 from services.services import ACTIVE_SHUTTLE_CONNECTIONS, SHUTTLE_BATTERY_LEVEL, SHUTTLE_MESSAGES_RECEIVED_TOTAL, \
     SHUTTLE_ERRORS_TOTAL
 
-SHUTTLE_TIMEOUT_SECONDS = 30  # Таймаут для зависших шаттлов
-WMS_WEBHOOK_URL = settings.WMS_WEBHOOK_URL
+
+@define(slots=True, frozen=True)
+class ConfigShuttle:
+    SHUTTLE_TIMEOUT_SECONDS: int = 30  # Таймаут для зависших шаттлов
+    WMS_WEBHOOK_URL: str = settings.WMS_WEBHOOK_URL
+
+
+conf = ConfigShuttle()
+
 
 async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optional[str] = None) -> bool:
     shuttle_config = settings.SHUTTLES_CONFIG.get(shuttle_id)
@@ -58,8 +66,9 @@ async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optiona
     return False
 
 
-async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_code: Optional[str] = None):
-    if not WMS_WEBHOOK_URL or not WMS_WEBHOOK_URL.strip():
+async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_code: Optional[str] = None,
+                              externaIID: Optional[str] = None):
+    if not conf.WMS_WEBHOOK_URL or not conf.WMS_WEBHOOK_URL.strip():
         logger.warning("WMS_WEBHOOK_URL не настроен или пуст. Пропуск отправки в WMS.")
         return
 
@@ -68,11 +77,12 @@ async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_
         "message": message,
         "status": status,
         "error_code": error_code,
+        "externaIID": externaIID,
         "timestamp": time.time()
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(WMS_WEBHOOK_URL, json=payload) as response:
+            async with session.post(conf.WMS_WEBHOOK_URL, json=payload) as response:
                 if response.status == 200:
                     logger.info(f"Успешно отправлено в WMS для {shuttle_id}: {message}")
                 else:
@@ -133,12 +143,13 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
         updates["status"] = ShuttleOperationalStatus.ERROR
         SHUTTLE_ERRORS_TOTAL.labels(shuttle_id=shuttle_id, f_code=message).inc()
 
-    if WMS_WEBHOOK_URL and WMS_WEBHOOK_URL.strip():
+    if conf.WMS_WEBHOOK_URL and conf.WMS_WEBHOOK_URL.strip():
         asyncio.create_task(send_to_wms_webhook(
             shuttle_id,
             message,
             updates.get("status", "UNKNOWN"),
-            updates.get("error_code")
+            updates.get("error_code"),
+            updates.get("externaIID")
         ))
 
     await update_shuttle_state_crud(shuttle_id, updates)
@@ -187,8 +198,8 @@ async def handle_shuttle_client(reader: asyncio.StreamReader, writer: asyncio.St
                     logger.info(f"Отправлен MRCD шаттлу {shuttle_id} для '{message_str}'")
             except asyncio.TimeoutError:
                 current_time = time.time()
-                if current_time - last_seen > SHUTTLE_TIMEOUT_SECONDS:
-                    logger.error(f"Шаттл {shuttle_id} не отвечает более {SHUTTLE_TIMEOUT_SECONDS} секунд")
+                if current_time - last_seen > conf.SHUTTLE_TIMEOUT_SECONDS:
+                    logger.error(f"Шаттл {shuttle_id} не отвечает более {conf.SHUTTLE_TIMEOUT_SECONDS} секунд")
                     await update_shuttle_state_crud(shuttle_id, {
                         "status": ShuttleOperationalStatus.ERROR,
                         "error_code": "TIMEOUT_NO_RESPONSE",
