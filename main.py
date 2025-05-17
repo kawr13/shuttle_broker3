@@ -10,17 +10,21 @@ from api.endpoints import router as api_router
 from services.shuttle_comms import start_shuttle_listener_server
 from core.redis_client import init_redis_pool, close_redis_pool
 from crud.shuttle_crud import init_shuttle_states_redis
-from services.command_processor import command_processor_worker
+from services.command_processor import command_processor_worker, initialize_shuttle_locks
 
 setup_logging()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Запуск шлюза WMS-Шаттл (Версия 2.0)...")
+    await settings.load_config()
     # Инициализация Redis
     await init_redis_pool()
+    await initialize_shuttle_locks()
+     # Загружаем конфигурацию из Redis
     await init_shuttle_states_redis()
-    logger.info("Redis инициализирован, состояния шаттлов загружены.")
+    logger.info("Redis инициализирован, состояния шаттлов и конфигурация загружены.")
 
     # Запуск TCP сервера для шаттлов
     asyncio.create_task(start_shuttle_listener_server())
@@ -33,7 +37,7 @@ async def lifespan(app: FastAPI):
         command_processor_tasks.append(task)
     logger.info(f"{settings.COMMAND_PROCESSOR_WORKERS} воркеров обработки команд запущены.")
 
-    yield  # Здесь FastAPI работает
+    yield
 
     # Остановка шлюза
     logger.info("Остановка шлюза WMS-Шаттл (Версия 2.0)...")
@@ -46,6 +50,7 @@ async def lifespan(app: FastAPI):
     logger.info("Воркеры обработки команд остановлены.")
     await close_redis_pool()
     logger.info("Соединение с Redis закрыто.")
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -62,10 +67,13 @@ Instrumentator(
 # Подключение маршрутов API
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+
 @app.get("/", summary="Health Check", include_in_schema=False)
 async def root():
     return {"message": f"{settings.PROJECT_NAME} активен"}
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=settings.GATEWAY_HOST, port=settings.GATEWAY_PORT, log_level=settings.LOG_LEVEL.lower())

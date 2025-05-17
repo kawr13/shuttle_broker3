@@ -1,0 +1,12 @@
+shuttles_config:
+  virtual_shuttle_1:
+    host: "127.0.0.1"
+    command_port: 2000
+  shuttle_2:
+    host: "10.10.10.12"
+    command_port: 2000
+stock_to_shuttle:
+  Главный:
+    - virtual_shuttle_1
+  Второй склад:
+    - shuttle_2

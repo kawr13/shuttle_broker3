@@ -7,7 +7,7 @@ from attrs import define
 
 from core.config import settings
 from core.logging_config import logger
-from crud.shuttle_crud import update_shuttle_state_crud
+from crud.shuttle_crud import update_shuttle_state_crud, get_shuttle_state_crud
 from models.shuttle import ShuttleOperationalStatus, ShuttleCommand
 from services.services import ACTIVE_SHUTTLE_CONNECTIONS, SHUTTLE_BATTERY_LEVEL, SHUTTLE_MESSAGES_RECEIVED_TOTAL, \
     SHUTTLE_ERRORS_TOTAL
@@ -35,7 +35,8 @@ async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optiona
     if not full_command.endswith('\n'):
         full_command += '\n'
 
-    logger.info(f"Отправка команды '{full_command.strip()}' шаттлу {shuttle_id} ({shuttle_config.host}:{shuttle_config.command_port})")
+    logger.info(
+        f"Отправка команды '{full_command.strip()}' шаттлу {shuttle_id} ({shuttle_config.host}:{shuttle_config.command_port})")
 
     try:
         reader, writer = await asyncio.wait_for(
@@ -53,16 +54,20 @@ async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optiona
 
     except asyncio.TimeoutError:
         logger.error(f"Таймаут при отправке команды шаттлу {shuttle_id} ({full_command.strip()})")
-        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR, "error_code": "TCP_TIMEOUT_SEND"})
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "TCP_TIMEOUT_SEND"})
     except ConnectionRefusedError:
         logger.error(f"Соединение отклонено шаттлом {shuttle_id} ({shuttle_config.host}:{shuttle_config.command_port})")
-        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR, "error_code": "CONNECTION_REFUSED"})
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "CONNECTION_REFUSED"})
     except OSError as e:
         logger.error(f"Ошибка сети при отправке команды шаттлу {shuttle_id}: {e}")
-        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR, "error_code": f"NET_ERROR_{e.errno}"})
+        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR,
+                                                     "error_code": f"NET_ERROR_{e.errno}"})
     except Exception as e:
         logger.error(f"Неизвестная ошибка при отправке команды шаттлу {shuttle_id}: {e}")
-        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR, "error_code": "UNKNOWN_SEND_ERROR"})
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "UNKNOWN_SEND_ERROR"})
     return False
 
 
@@ -77,13 +82,14 @@ async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_
         "message": message,
         "status": status,
         "error_code": error_code,
-        "externaIID": externaIID,
+        "externaIID": externaIID,  # externaIID is now passed correctly
         "timestamp": time.time()
     }
+    logger.debug(f"Отправка Webhook в WMS: {payload}")  # Added debug log for payload
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(conf.WMS_WEBHOOK_URL, json=payload) as response:
-                if response.status == 200:
+                if response.status >= 200 and response.status < 300:  # Check for 2xx success codes
                     logger.info(f"Успешно отправлено в WMS для {shuttle_id}: {message}")
                 else:
                     logger.error(f"Ошибка отправки в WMS: {response.status} {await response.text()}")
@@ -92,38 +98,48 @@ async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_
 
 
 async def process_shuttle_message_internal(shuttle_id: str, message: str):
+    # Fetch current state to get externaIID associated with the command
+    # This externaIID was stored when the command was initially processed and sent.
+    current_state = await get_shuttle_state_crud(shuttle_id)
+    current_externaIID = current_state.externaIID if current_state else None
+
     updates = {"last_message_sent_to_wms": message, "last_seen": time.time()}
 
     if message.endswith("_STARTED"):
         updates["status"] = ShuttleOperationalStatus.BUSY
     elif message.endswith("_DONE") or message.endswith("_ABORT"):
         updates["status"] = ShuttleOperationalStatus.FREE
-        updates["current_command"] = None
+        updates["current_command"] = None  # Clear command when done/aborted
         if message.endswith("_ABORT"):
             updates["error_code"] = message
-            updates["status"] = ShuttleOperationalStatus.ERROR
+            updates["status"] = ShuttleOperationalStatus.ERROR  # ABORT implies an error state transition
 
     if message.startswith("LOCATION="):
         updates["location_data"] = message.split("=", 1)[1]
-        updates["status"] = ShuttleOperationalStatus.FREE
+        updates["status"] = ShuttleOperationalStatus.FREE  # Location implies task done
         updates["current_command"] = None
     elif message.startswith("COUNT_") and "=" in message:
         updates["pallet_count_data"] = message
-        updates["status"] = ShuttleOperationalStatus.FREE
+        updates["status"] = ShuttleOperationalStatus.FREE  # Count implies task done
         updates["current_command"] = None
     elif message.startswith("STATUS="):
-        status_val = message.split("=", 1)[1]
+        status_val = message.split("=", 1)[1].upper()  # Ensure uppercase for matching
         status_map = {
             "FREE": ShuttleOperationalStatus.FREE,
-            "CARGO": ShuttleOperationalStatus.BUSY,
+            "CARGO": ShuttleOperationalStatus.BUSY,  # Map CARGO to BUSY
             "BUSY": ShuttleOperationalStatus.BUSY,
             "NOT_READY": ShuttleOperationalStatus.NOT_READY
         }
         updates["status"] = status_map.get(status_val, ShuttleOperationalStatus.UNKNOWN)
+        # If STATUS message indicates FREE or NOT_READY, clear current command
+        if updates["status"] in [ShuttleOperationalStatus.FREE, ShuttleOperationalStatus.NOT_READY,
+                                 ShuttleOperationalStatus.UNKNOWN]:
+            updates["current_command"] = None  # Clear command if status indicates not busy
     elif message.startswith("BATTERY="):
         level_str = message.split("=", 1)[1]
         updates["battery_level"] = level_str
         try:
+            # Handle '<' prefix if present
             parsed_level = float(level_str.replace('%', '').lstrip('<'))
             SHUTTLE_BATTERY_LEVEL.labels(shuttle_id=shuttle_id).set(parsed_level)
         except ValueError:
@@ -140,20 +156,23 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
             logger.warning(f"Не удалось распарсить WLH: {message}")
     elif message.startswith("F_CODE="):
         updates["error_code"] = message
-        updates["status"] = ShuttleOperationalStatus.ERROR
+        updates["status"] = ShuttleOperationalStatus.ERROR  # F_CODE indicates Error state
+        updates["current_command"] = None  # Clear command on error
         SHUTTLE_ERRORS_TOTAL.labels(shuttle_id=shuttle_id, f_code=message).inc()
 
+    # Send webhook with the externaIID retrieved from the state
     if conf.WMS_WEBHOOK_URL and conf.WMS_WEBHOOK_URL.strip():
         asyncio.create_task(send_to_wms_webhook(
             shuttle_id,
             message,
-            updates.get("status", "UNKNOWN"),
-            updates.get("error_code"),
-            updates.get("externaIID")
+            updates.get("status", "UNKNOWN"),  # Use the potentially updated status
+            updates.get("error_code"),  # Use the potentially updated error code
+            current_externaIID  # Pass the externaIID from the state
         ))
 
     await update_shuttle_state_crud(shuttle_id, updates)
     logger.debug(f"Обработано сообщение от {shuttle_id}: {message}, обновления: {updates}")
+
 
 async def handle_shuttle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     ACTIVE_SHUTTLE_CONNECTIONS.inc()
@@ -182,7 +201,8 @@ async def handle_shuttle_client(reader: asyncio.StreamReader, writer: asyncio.St
                 message_str = data.decode('utf-8').strip()
                 logger.info(f"Получено сообщение от {shuttle_id} ({shuttle_ip}): '{message_str}'")
 
-                SHUTTLE_MESSAGES_RECEIVED_TOTAL.labels(shuttle_id=shuttle_id, message_type=message_str.split("=")[0] if "=" in message_str else message_str).inc()
+                SHUTTLE_MESSAGES_RECEIVED_TOTAL.labels(shuttle_id=shuttle_id, message_type=message_str.split("=")[
+                    0] if "=" in message_str else message_str).inc()
                 try:
                     await process_shuttle_message_internal(shuttle_id, message_str)
                 except Exception as e:
@@ -220,6 +240,7 @@ async def handle_shuttle_client(reader: asyncio.StreamReader, writer: asyncio.St
         except Exception:
             pass
         ACTIVE_SHUTTLE_CONNECTIONS.dec()
+
 
 async def start_shuttle_listener_server():
     server = await asyncio.start_server(

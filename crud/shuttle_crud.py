@@ -1,7 +1,11 @@
 import json
 
 import time # Уже импортировано
+from pprint import pprint
 from typing import Dict, Optional, List # Уже импортировано
+
+from icecream import ic
+
 from models.shuttle import ShuttleState, ShuttleOperationalStatus # Уже импортировано
 from core.config import settings # Уже импортировано
 from core.logging_config import logger # Уже импортировано
@@ -29,6 +33,7 @@ async def get_shuttle_state_crud(shuttle_id: str) -> Optional[ShuttleState]:  # 
     r_crud = get_redis_client()
     key = await _get_shuttle_key(shuttle_id)
     state_json = await r_crud.get(key)
+    ic(state_json)
     if state_json:
         return ShuttleState.model_validate_json(state_json)
     return None

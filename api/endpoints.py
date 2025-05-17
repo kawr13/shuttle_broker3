@@ -1,29 +1,35 @@
 from pprint import pprint
 from typing import Dict, Optional
 
+import yaml
 from fastapi import APIRouter, HTTPException, status
+from icecream import ic
 
 from core.config import settings
 from core.logging_config import logger
 from crud.shuttle_crud import get_shuttle_state_crud
+from models.shuttle import ShuttleCommand
 from models.wms import WMSCommandPayload
 from services.command_processor import add_command_to_queue
 from services.services import COMMANDS_SENT_TOTAL
 
 router = APIRouter()
 
-# Маппинг склада (nameStockERP) на shuttle_id
-STOCK_TO_SHUTTLE = {
-    "Главный": ["virtual_shuttle_1", "virtual_shuttle_2"],
-    "Второй склад": ["shuttle_3"]
+ALLOWED_WHEN_BUSY_COMMANDS = {
+    ShuttleCommand.MRCD,
+    ShuttleCommand.STATUS,
+    ShuttleCommand.HOME, # <-- Add HOME here
 }
 
 
 # Функция для поиска свободного шаттла
-async def get_free_shuttle(stock_name: str) -> str | None:
-    shuttles = STOCK_TO_SHUTTLE.get(stock_name, [])
+async def get_free_shuttle(stock_name: str, command: str) -> str | None:
+    shuttles = settings.STOCK_TO_SHUTTLE.get(stock_name, [])
+    ic(shuttles)
     for shuttle_id in shuttles:
-        state = await get_shuttle_state_crud(shuttle_id)  # Предполагаем, что есть такая функция
+        state = await get_shuttle_state_crud(shuttle_id)
+        if command in ALLOWED_WHEN_BUSY_COMMANDS:
+            return shuttle_id
         if state and state.status == "FREE":
             return shuttle_id
     return None
@@ -36,27 +42,23 @@ async def send_command(payload: WMSCommandPayload):
     """
     queued_commands = []
     for placement in payload.placement:
-        # Определяем shuttle_id по nameStockERP
-        # shuttle_id = STOCK_TO_SHUTTLE.get(placement.nameStockERP)
         stock_name = placement.nameStockERP
-        shuttle_id = await get_free_shuttle(stock_name)
-        if not shuttle_id:
-            raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
-
-        # if not shuttle_id:
-        #     logger.error(f"Unknown stock: {placement.nameStockERP}")
-        #     raise HTTPException(status_code=400, detail=f"Unknown stock: {placement.nameStockERP}")
-        if shuttle_id not in settings.SHUTTLES_CONFIG:
-            logger.error(f"Shuttle not found: {shuttle_id}")
-            raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
-
-        # Обрабатываем каждую строку размещения
         for line in placement.placementLine:
             command = line.ShuttleIN
+            ic(command)
+            shuttle_id = await get_free_shuttle(stock_name, command)
+            if not shuttle_id:
+                raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
+
+            if shuttle_id not in settings.SHUTTLES_CONFIG:
+                logger.error(f"Shuttle not found: {shuttle_id}")
+                raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+
+
             success = await add_command_to_queue(
-                shuttle_id=shuttle_id,
+                shuttle_id=ic(shuttle_id),
                 command=command,
-                params=line.params,  # Используем params, если они есть
+                params=line.params,
                 externaIID=line.externaIID,
                 priority=5 if command == "HOME" else 10
             )
@@ -69,6 +71,7 @@ async def send_command(payload: WMSCommandPayload):
 
     logger.info(f"Queued commands: {queued_commands}")
     return {"status": "queued", "commands": queued_commands}
+
 
 @router.get("/shuttle/{shuttle_id}/status", summary="Get status of a specific shuttle")
 async def get_status(shuttle_id: str) -> Dict[str, Optional[str]]:
@@ -90,3 +93,29 @@ async def get_status(shuttle_id: str) -> Dict[str, Optional[str]]:
     if shuttle_state is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shuttle {shuttle_id} not found")
     return response
+
+
+@router.post("/shuttle/{shuttle_id}/move-to-stock", summary="Move shuttle to a new stock")
+async def move_shuttle_to_stock(shuttle_id: str, new_stock: str):
+    """
+    Move a shuttle to a new stock and update configuration in Redis.
+    - **shuttle_id**: ID of the shuttle (e.g., virtual_shuttle_1)
+    - **new_stock**: Name of the new stock (e.g., "Второй склад")
+    """
+    if shuttle_id not in settings.SHUTTLES_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+    await settings.update_shuttle_stock(shuttle_id, new_stock)
+    logger.info(f"Shuttle {shuttle_id} moved to stock {new_stock}")
+
+    with open("initial_config.yaml", "r") as f:
+        config_data = yaml.safe_load(f)
+    for stock, shuttles in config_data["stock_to_shuttle"].items():
+        if shuttle_id in shuttles:
+            shuttles.remove(shuttle_id)
+            break
+    if new_stock not in config_data["stock_to_shuttle"]:
+        config_data["stock_to_shuttle"][new_stock] = []
+    config_data["stock_to_shuttle"][new_stock].append(shuttle_id)
+    with open("initial_config.yaml", "w") as f:
+        yaml.dump(config_data, f)
+    return {"status": "success", "shuttle_id": shuttle_id, "new_stock": new_stock}

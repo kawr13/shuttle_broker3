@@ -1,12 +1,13 @@
 from typing import Optional
-
 import redis.asyncio as redis
-from core.config import settings # Уже импортировано
-from core.logging_config import logger # Уже импортировано
+from core.config import settings
+from core.logging_config import logger
 
-redis_client_instance: Optional[redis.Redis] = None # Переименовал, чтобы не конфликтовать с импортом
+redis_client_instance: Optional[redis.Redis] = None
+
 
 async def init_redis_pool():
+
     global redis_client_instance
     try:
         redis_client_instance = redis.Redis(
@@ -23,6 +24,7 @@ async def init_redis_pool():
         redis_client_instance = None
 
 async def close_redis_pool():
+    from core import logger
     if redis_client_instance:
         await redis_client_instance.close()
         logger.info("Соединение с Redis закрыто.")
