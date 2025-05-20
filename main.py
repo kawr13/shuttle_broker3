@@ -10,7 +10,7 @@ from api.endpoints import router as api_router
 from services.shuttle_comms import start_shuttle_listener_server
 from core.redis_client import init_redis_pool, close_redis_pool
 from crud.shuttle_crud import init_shuttle_states_redis
-from services.command_processor import command_processor_worker, initialize_shuttle_locks
+from services.command_processor import command_processor_worker, initialize_shuttle_locks, initialize_shuttle_queues
 
 setup_logging()
 
@@ -22,6 +22,7 @@ async def lifespan(app: FastAPI):
     # Инициализация Redis
     await init_redis_pool()
     await initialize_shuttle_locks()
+    await initialize_shuttle_queues()
      # Загружаем конфигурацию из Redis
     await init_shuttle_states_redis()
     logger.info("Redis инициализирован, состояния шаттлов и конфигурация загружены.")

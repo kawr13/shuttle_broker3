@@ -443,7 +443,7 @@ from api.endpoints import router as api_router
 from services.shuttle_comms import start_shuttle_listener_server
 from core.redis_client import init_redis_pool, close_redis_pool
 from crud.shuttle_crud import init_shuttle_states_redis
-from services.command_processor import command_processor_worker, initialize_shuttle_locks
+from services.command_processor import command_processor_worker, initialize_shuttle_locks, initialize_shuttle_queues
 
 setup_logging()
 
@@ -455,6 +455,7 @@ async def lifespan(app: FastAPI):
     # Инициализация Redis
     await init_redis_pool()
     await initialize_shuttle_locks()
+    await initialize_shuttle_queues()
      # Загружаем конфигурацию из Redis
     await init_shuttle_states_redis()
     logger.info("Redis инициализирован, состояния шаттлов и конфигурация загружены.")
@@ -1147,6 +1148,16 @@ from services.shuttle_comms import send_command_to_shuttle
 
 command_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=settings.COMMAND_QUEUE_MAX_SIZE)
 shuttle_locks: Dict[str, asyncio.Lock] = {}
+shuttle_queues: Dict[str, asyncio.Queue] = {}
+
+
+async def initialize_shuttle_queues():
+    global shuttle_queues
+    shuttle_queues = {
+        shuttle_id: asyncio.Queue(maxsize=settings.COMMAND_QUEUE_MAX_SIZE)
+        for shuttle_id in settings.SHUTTLES_CONFIG.keys()
+    }
+    logger.info(f"Shuttle queues initialized: {list(shuttle_queues.keys())}")
 
 
 async def initialize_shuttle_locks():
@@ -1212,20 +1223,21 @@ async def process_wms_command_internal(shuttle_id: str, command: ShuttleCommand,
 
 
 async def add_command_to_queue(shuttle_id: str, command: ShuttleCommand,
-                               params: Optional[str] = None, externaIID: Optional[str] = None, priority: int = 10):
+                              params: Optional[str] = None, externaIID: Optional[str] = None, priority: int = 10):
     data = {
         "shuttle_id": shuttle_id,
         "command": command,
         "params": params,
-        "externaIID": externaIID  # Сохраняем externaIID в данных команды
+        "externaIID": externaIID,
+        "priority": priority  # Сохраняем приоритет для возможного использования
     }
     try:
-        await command_queue.put((priority, data))
-        COMMAND_QUEUE_SIZE_METRIC.set(command_queue.qsize())
-        logger.info(f"Команда {command.value} для {shuttle_id} добавлена в очередь с приоритетом {priority}.")
+        await shuttle_queues[shuttle_id].put(data)  # Добавляем в очередь конкретного шаттла
+        COMMAND_QUEUE_SIZE_METRIC.set(sum(q.qsize() for q in shuttle_queues.values()))  # Обновляем метрику
+        logger.info(f"Команда {command.value} для {shuttle_id} добавлена в очередь.")
         return True
     except asyncio.QueueFull:
-        logger.error(f"Очередь команд заполнена. Команда {command.value} для {shuttle_id} не добавлена.")
+        logger.error(f"Очередь команд для {shuttle_id} заполнена. Команда {command.value} не добавлена.")
         return False
 
 
@@ -1233,38 +1245,35 @@ async def command_processor_worker(worker_id: int):
     logger.info(f"Воркер обработки команд {worker_id} запущен.")
     while True:
         try:
-            priority, data = await command_queue.get()
-            COMMAND_QUEUE_SIZE_METRIC.set(command_queue.qsize())
-            ic(data)
-            shuttle_id = data["shuttle_id"]
-            command = data["command"]
-            params = data.get("params")
-            externaIID = data.get("externaIID")
+            for shuttle_id in settings.SHUTTLES_CONFIG.keys():
+                shuttle_lock = shuttle_locks.get(shuttle_id)
+                if not shuttle_lock or shuttle_lock.locked():
+                    continue  # Пропускаем, если лок занят другим воркером
 
-            shuttle_lock = shuttle_locks.get(shuttle_id)
-            if not shuttle_lock:
-                logger.error(f"Не найден лок для шаттла {shuttle_id}. Команда {command.value} пропущена.")
-                command_queue.task_done()
-                continue
+                state = await get_shuttle_state_crud(shuttle_id)
+                if state.status != ShuttleOperationalStatus.FREE:
+                    continue  # Пропускаем занятые шаттлы
 
-            logger.info(f"Воркер {worker_id} взял команду для шаттла {shuttle_id}: {command.value}")
+                try:
+                    data = shuttle_queues[shuttle_id].get_nowait()  # Берем команду без блокировки
+                    async with shuttle_lock:
+                        await process_wms_command_internal(
+                            shuttle_id=shuttle_id,
+                            command=data["command"],
+                            params=data.get("params"),
+                            externaIID=data.get("externaIID")
+                        )
+                    shuttle_queues[shuttle_id].task_done()
+                    COMMAND_QUEUE_SIZE_METRIC.set(sum(q.qsize() for q in shuttle_queues.values()))
+                except asyncio.QueueEmpty:
+                    pass  # Очередь пуста, переходим к следующему шаттлу
 
-            async with shuttle_lock:
-                await process_wms_command_internal(
-                    shuttle_id=shuttle_id,
-                    command=command,
-                    params=params,
-                    externaIID=externaIID
-                )
-
-            command_queue.task_done()
+            await asyncio.sleep(0.5)  # Небольшая задержка, чтобы не перегружать цикл
         except asyncio.CancelledError:
             logger.info(f"Воркер обработки команд {worker_id} останавливается.")
             break
         except Exception as e:
             logger.error(f"Ошибка в воркере {worker_id}: {e}", exc_info=True)
-            if not command_queue.empty() and 'priority' in locals():
-                command_queue.task_done()
 
 
 # services/services.py

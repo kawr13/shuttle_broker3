@@ -6,7 +6,8 @@ from models.shuttle import ShuttleCommand
 class PlacementLine(BaseModel):
     externaIID: str
     ShuttleIN: ShuttleCommand
-    params: Optional[str] = None  # Добавлено для гибкости, если параметры появятся позже
+    params: Optional[str] = None
+    cell_id: Optional[str] = None  # Добавляем как опциональное поле
 
 
 class Placement(BaseModel):

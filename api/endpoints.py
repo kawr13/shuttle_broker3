@@ -8,7 +8,7 @@ from icecream import ic
 from core.config import settings
 from core.logging_config import logger
 from crud.shuttle_crud import get_shuttle_state_crud
-from models.shuttle import ShuttleCommand
+from models.shuttle import ShuttleCommand, ShuttleOperationalStatus
 from models.wms import WMSCommandPayload
 from services.command_processor import add_command_to_queue
 from services.services import COMMANDS_SENT_TOTAL
@@ -23,44 +23,60 @@ ALLOWED_WHEN_BUSY_COMMANDS = {
 
 
 # Функция для поиска свободного шаттла
-async def get_free_shuttle(stock_name: str, command: str) -> str | None:
+async def get_free_shuttle(stock_name: str, cell_id: Optional[str], command: str,
+                           externaIID: Optional[str] = None) -> str | None:
+    if command == ShuttleCommand.HOME.value and externaIID:
+        # Поиск шаттла по externaIID
+        for sid in settings.SHUTTLES_CONFIG.keys():
+            state = await get_shuttle_state_crud(sid)
+            if state and state.externaIID == externaIID:
+                return sid
+        logger.error(f"Шаттл с externaIID {externaIID} не найден")
+        return None
+
+    # Получаем шаттлы для склада
     shuttles = settings.STOCK_TO_SHUTTLE.get(stock_name, [])
-    ic(shuttles)
-    for shuttle_id in shuttles:
-        state = await get_shuttle_state_crud(shuttle_id)
+
+    # Если ячейки не используются, shuttles уже является списком
+    # Если ячейки будут добавлены позже, можно будет раскомментировать следующую логику:
+    # if cell_id and isinstance(shuttles, dict) and cell_id in shuttles:
+    #     shuttles = shuttles[cell_id]
+    # else:
+    #     shuttles = [sid for sublist in shuttles.values() for sid in sublist] if isinstance(shuttles, dict) else shuttles
+
+    for sid in shuttles:
+        state = await get_shuttle_state_crud(sid)
         if command in ALLOWED_WHEN_BUSY_COMMANDS:
-            return shuttle_id
-        if state and state.status == "FREE":
-            return shuttle_id
+            return sid
+        if state and state.status == ShuttleOperationalStatus.FREE:
+            return sid
     return None
 
 
 @router.post("/command", summary="Send commands to shuttles")
 async def send_command(payload: WMSCommandPayload):
-    """
-    Send commands to shuttles based on WMS placement data.
-    """
     queued_commands = []
     for placement in payload.placement:
         stock_name = placement.nameStockERP
         for line in placement.placementLine:
             command = line.ShuttleIN
+            cell_id = line.cell_id  # Может быть None
+            externaIID = line.externaIID
             ic(command)
-            shuttle_id = await get_free_shuttle(stock_name, command)
+            shuttle_id = await get_free_shuttle(stock_name, cell_id, command.value, externaIID)
             if not shuttle_id:
-                raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
+                raise HTTPException(status_code=503, detail=f"Нет подходящих шаттлов для склада {stock_name}" + (f", ячейка {cell_id}" if cell_id else ""))
 
             if shuttle_id not in settings.SHUTTLES_CONFIG:
                 logger.error(f"Shuttle not found: {shuttle_id}")
                 raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
 
-
             success = await add_command_to_queue(
                 shuttle_id=ic(shuttle_id),
                 command=command,
                 params=line.params,
-                externaIID=line.externaIID,
-                priority=5 if command == "HOME" else 10
+                externaIID=externaIID,
+                priority=5 if command == ShuttleCommand.HOME else 10
             )
             if not success:
                 logger.error(f"Failed to queue command {command.value} for {shuttle_id}: Queue full")
