@@ -1,0 +1,1558 @@
+# .env
+PROJECT_NAME=Stelkon WMS-Shuttle Gateway
+API_V1_STR=/api/v1
+GATEWAY_HOST=0.0.0.0
+GATEWAY_PORT=8000
+SHUTTLE_LISTENER_PORT=8181
+TCP_CONNECT_TIMEOUT=5.0
+TCP_READ_TIMEOUT=20.0
+TCP_WRITE_TIMEOUT=5.0
+LOG_LEVEL=INFO
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+COMMAND_QUEUE_MAX_SIZE=1000
+COMMAND_PROCESSOR_WORKERS=3
+WMS_WEBHOOK_URL=
+
+# api/__init__.py
+
+
+# api/endpoints.py
+from pprint import pprint
+from typing import Dict, Optional
+
+import yaml
+from fastapi import APIRouter, HTTPException, status
+from icecream import ic
+
+from core.config import settings
+from core.logging_config import logger
+from crud.shuttle_crud import get_shuttle_state_crud
+from models.shuttle import ShuttleCommand
+from models.wms import WMSCommandPayload
+from services.command_processor import add_command_to_queue
+from services.services import COMMANDS_SENT_TOTAL
+
+router = APIRouter()
+
+ALLOWED_WHEN_BUSY_COMMANDS = {
+    ShuttleCommand.MRCD,
+    ShuttleCommand.STATUS,
+    ShuttleCommand.HOME, # <-- Add HOME here
+}
+
+
+# Функция для поиска свободного шаттла
+async def get_free_shuttle(stock_name: str, command: str) -> str | None:
+    shuttles = settings.STOCK_TO_SHUTTLE.get(stock_name, [])
+    ic(shuttles)
+    for shuttle_id in shuttles:
+        state = await get_shuttle_state_crud(shuttle_id)
+        if command in ALLOWED_WHEN_BUSY_COMMANDS:
+            return shuttle_id
+        if state and state.status == "FREE":
+            return shuttle_id
+    return None
+
+
+@router.post("/command", summary="Send commands to shuttles")
+async def send_command(payload: WMSCommandPayload):
+    """
+    Send commands to shuttles based on WMS placement data.
+    """
+    queued_commands = []
+    for placement in payload.placement:
+        stock_name = placement.nameStockERP
+        for line in placement.placementLine:
+            command = line.ShuttleIN
+            ic(command)
+            shuttle_id = await get_free_shuttle(stock_name, command)
+            if not shuttle_id:
+                raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
+
+            if shuttle_id not in settings.SHUTTLES_CONFIG:
+                logger.error(f"Shuttle not found: {shuttle_id}")
+                raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+
+
+            success = await add_command_to_queue(
+                shuttle_id=ic(shuttle_id),
+                command=command,
+                params=line.params,
+                externaIID=line.externaIID,
+                priority=5 if command == "HOME" else 10
+            )
+            if not success:
+                logger.error(f"Failed to queue command {command.value} for {shuttle_id}: Queue full")
+                COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value,
+                                           status="failure_queue_full").inc()
+                raise HTTPException(status_code=503, detail="Command queue is full")
+            queued_commands.append({"shuttle_id": shuttle_id, "command": command.value})
+
+    logger.info(f"Queued commands: {queued_commands}")
+    return {"status": "queued", "commands": queued_commands}
+
+
+@router.get("/shuttle/{shuttle_id}/status", summary="Get status of a specific shuttle")
+async def get_status(shuttle_id: str) -> Dict[str, Optional[str]]:
+    """
+    Get status of a specific shuttle.
+    - **shuttle_id**: ID of the shuttle (e.g., virtual_shuttle_1)
+    """
+    if shuttle_id not in settings.SHUTTLES_CONFIG:
+        logger.error(f"Invalid shuttle_id: {shuttle_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shuttle {shuttle_id} not found")
+    shuttle_state = await get_shuttle_state_crud(shuttle_id)
+    response_model = shuttle_state.model_dump(mode="json")
+    response = {
+        **response_model,
+        "wlh_hours": str(response_model["wlh_hours"]),
+        "last_seen": str(response_model["last_seen"]),
+    }
+    pprint(response_model)
+    if shuttle_state is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shuttle {shuttle_id} not found")
+    return response
+
+
+@router.post("/shuttle/{shuttle_id}/move-to-stock", summary="Move shuttle to a new stock")
+async def move_shuttle_to_stock(shuttle_id: str, new_stock: str):
+    """
+    Move a shuttle to a new stock and update configuration in Redis.
+    - **shuttle_id**: ID of the shuttle (e.g., virtual_shuttle_1)
+    - **new_stock**: Name of the new stock (e.g., "Второй склад")
+    """
+    if shuttle_id not in settings.SHUTTLES_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+    await settings.update_shuttle_stock(shuttle_id, new_stock)
+    logger.info(f"Shuttle {shuttle_id} moved to stock {new_stock}")
+
+    with open("initial_config.yaml", "r") as f:
+        config_data = yaml.safe_load(f)
+    for stock, shuttles in config_data["stock_to_shuttle"].items():
+        if shuttle_id in shuttles:
+            shuttles.remove(shuttle_id)
+            break
+    if new_stock not in config_data["stock_to_shuttle"]:
+        config_data["stock_to_shuttle"][new_stock] = []
+    config_data["stock_to_shuttle"][new_stock].append(shuttle_id)
+    with open("initial_config.yaml", "w") as f:
+        yaml.dump(config_data, f)
+    return {"status": "success", "shuttle_id": shuttle_id, "new_stock": new_stock}
+
+# core/__init__.py
+
+
+# core/config.py
+import os
+from pprint import pprint
+from typing import Dict, Optional
+
+import yaml
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field
+import redis.asyncio as redis
+import json
+
+
+class ShuttleNetworkConfig(BaseModel):
+    host: str
+    command_port: int = 2000
+
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = os.getenv('PROJECT_NAME', 'shuttle')
+    API_V1_STR: str = os.getenv('API_V1_STR', '/api/v1')
+    GATEWAY_HOST: str = os.getenv('GATEWAY_HOST', 'localhost')
+    GATEWAY_PORT: int = int(os.getenv('GATEWAY_PORT', '8000'))
+    SHUTTLE_LISTENER_PORT: int = int(os.getenv('SHUTTLE_LISTENER_PORT', '5000'))
+    TCP_CONNECT_TIMEOUT: float = float(os.getenv('TCP_CONNECT_TIMEOUT', '5.0'))
+    TCP_READ_TIMEOUT: float = float(os.getenv('TCP_READ_TIMEOUT', '20.0'))
+    TCP_WRITE_TIMEOUT: float = float(os.getenv('TCP_WRITE_TIMEOUT', '5.0'))
+    LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
+    REDIS_HOST: str = os.getenv('REDIS_HOST', 'localhost')
+    REDIS_PORT: int = int(os.getenv('REDIS_PORT', '6379'))
+    REDIS_DB: int = int(os.getenv('REDIS_DB', '0'))
+    REDIS_PASSWORD: Optional[str] = os.getenv('REDIS_PASSWORD', None)
+    COMMAND_QUEUE_MAX_SIZE: int = int(os.getenv('COMMAND_QUEUE_MAX_SIZE', '1000'))
+    COMMAND_PROCESSOR_WORKERS: int = int(os.getenv('COMMAND_PROCESSOR_WORKERS', '1'))
+    WMS_WEBHOOK_URL: str = os.getenv('WMS_WEBHOOK_URL', '')
+    SHUTTLES_CONFIG: Dict[str, ShuttleNetworkConfig] = {}
+    STOCK_TO_SHUTTLE: Dict[str, list[str]] = {}
+
+    redis_client: Optional[redis.Redis] = Field(default=None, exclude=True)
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra='ignore')
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.redis_client = redis.Redis(
+            host=self.REDIS_HOST,
+            port=self.REDIS_PORT,
+            db=self.REDIS_DB,
+            password=self.REDIS_PASSWORD,
+            decode_responses=True
+        )
+
+    async def load_config(self):
+        """Загружает конфигурацию из Redis."""
+        shuttles_data = await self.redis_client.get("shuttles_config")
+        stock_data = await self.redis_client.get("stock_to_shuttle")
+        with open("initial_config.yaml", "r") as f:
+            config_data = yaml.safe_load(f)
+        pprint(config_data)
+        if shuttles_data:
+            self.SHUTTLES_CONFIG = {
+                k: ShuttleNetworkConfig(**v) for k, v in json.loads(shuttles_data).items()
+            }
+        else:
+            self.SHUTTLES_CONFIG = {
+                k: ShuttleNetworkConfig(**v)
+                for k, v in config_data["shuttles_config"].items()
+            }
+            await self.save_config()  # Сохраняем в Redis
+
+        if stock_data:
+            self.STOCK_TO_SHUTTLE = json.loads(stock_data)
+        else:
+            self.STOCK_TO_SHUTTLE = config_data["stock_to_shuttle"]
+            await self.save_config()
+        pprint(self.SHUTTLES_CONFIG)
+        pprint(self.STOCK_TO_SHUTTLE)
+
+
+    async def save_config(self):
+        """Сохраняет конфигурацию в Redis."""
+        await self.redis_client.set(
+            "shuttles_config",
+            json.dumps({k: v.dict() for k, v in self.SHUTTLES_CONFIG.items()})
+        )
+        await self.redis_client.set("stock_to_shuttle", json.dumps(self.STOCK_TO_SHUTTLE))
+
+    async def update_shuttle_stock(self, shuttle_id: str, new_stock: str):
+        """Перемещает шаттл на новый склад и обновляет конфигурацию."""
+        for stock, shuttles in self.STOCK_TO_SHUTTLE.items():
+            if shuttle_id in shuttles:
+                shuttles.remove(shuttle_id)
+        if new_stock not in self.STOCK_TO_SHUTTLE:
+            self.STOCK_TO_SHUTTLE[new_stock] = []
+        self.STOCK_TO_SHUTTLE[new_stock].append(shuttle_id)
+        await self.save_config()
+
+
+settings = Settings()
+
+# core/logging_config.py
+import logging
+import sys
+from core.config import settings # Уже импортировано выше, если это один файл
+
+def setup_logging():
+    logging.basicConfig(
+        level=settings.LOG_LEVEL.upper(),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    # Уменьшаем "болтливость" некоторых библиотек
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("redis").setLevel(logging.INFO)
+
+
+logger = logging.getLogger(settings.PROJECT_NAME)
+
+
+# core/redis_client.py
+from typing import Optional
+import redis.asyncio as redis
+from core.config import settings
+from core.logging_config import logger
+
+redis_client_instance: Optional[redis.Redis] = None
+
+
+async def init_redis_pool():
+
+    global redis_client_instance
+    try:
+        redis_client_instance = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True
+        )
+        await redis_client_instance.ping()
+        logger.info("Успешное подключение к Redis.")
+    except Exception as e:
+        logger.error(f"Не удалось подключиться к Redis: {e}")
+        redis_client_instance = None
+
+async def close_redis_pool():
+    from core import logger
+    if redis_client_instance:
+        await redis_client_instance.close()
+        logger.info("Соединение с Redis закрыто.")
+
+def get_redis_client() -> redis.Redis:
+    if not redis_client_instance:
+        raise ConnectionError("Клиент Redis не инициализирован или соединение потеряно.")
+    return redis_client_instance
+
+
+# crud/__init__.py
+
+
+# crud/shuttle_crud.py
+import json
+
+import time # Уже импортировано
+from pprint import pprint
+from typing import Dict, Optional, List # Уже импортировано
+
+from icecream import ic
+
+from models.shuttle import ShuttleState, ShuttleOperationalStatus # Уже импортировано
+from core.config import settings # Уже импортировано
+from core.logging_config import logger # Уже импортировано
+from core.redis_client import get_redis_client # Уже импортировано
+import redis.asyncio as redis # Уже импортировано
+
+SHUTTLE_STATE_PREFIX = "shuttle_state:"
+
+
+async def _get_shuttle_key(shuttle_id: str) -> str:
+    return f"{SHUTTLE_STATE_PREFIX}{shuttle_id}"
+
+
+async def init_shuttle_states_redis():
+    r_crud = get_redis_client()  # Используем локальную переменную, чтобы не путать с импортом
+    for shuttle_id in settings.SHUTTLES_CONFIG.keys():
+        key = await _get_shuttle_key(shuttle_id)
+        if not await r_crud.exists(key):
+            initial_state = ShuttleState(shuttle_id=shuttle_id)
+            await r_crud.set(key, initial_state.model_dump_json())
+            logger.info(f"Инициализировано состояние для шаттла {shuttle_id} в Redis.")
+
+
+async def get_shuttle_state_crud(shuttle_id: str) -> Optional[ShuttleState]:  # Переименовал во избежание конфликта
+    r_crud = get_redis_client()
+    key = await _get_shuttle_key(shuttle_id)
+    state_json = await r_crud.get(key)
+    ic(state_json)
+    if state_json:
+        return ShuttleState.model_validate_json(state_json)
+    return None
+
+
+async def update_shuttle_state_crud(shuttle_id: str, updates: Dict) -> Optional[ShuttleState]:  # Переименовал
+    r_crud = get_redis_client()
+    key = await _get_shuttle_key(shuttle_id)
+
+    # Оптимистическая блокировка с использованием WATCH
+    async with r_crud.pipeline(transaction=True) as pipe:
+        while True:  # Цикл для повторной попытки в случае WatchError
+            try:
+                await pipe.watch(key)
+                current_state_json = await pipe.get(key)
+
+                if not current_state_json:
+                    logger.warning(f"Попытка обновить состояние несуществующего шаттла {shuttle_id} в Redis.")
+                    # Можно создать, если нужно:
+                    # current_state_obj = ShuttleState(shuttle_id=shuttle_id, **updates)
+                    # current_state_obj.last_seen = time.time()
+                    # pipe.multi() # Начать транзакцию
+                    # await pipe.set(key, current_state_obj.model_dump_json())
+                    # await pipe.execute()
+                    # return current_state_obj
+                    return None
+
+                current_state_obj = ShuttleState.model_validate_json(current_state_json)
+
+                updated_data = current_state_obj.model_dump()
+                updated_data.update(updates)
+                updated_data["last_seen"] = time.time()
+
+                # writer не хранится в Redis
+                updated_data.pop("writer", None)
+
+                new_state_obj = ShuttleState(**updated_data)
+                pipe.multi()  # Начать транзакцию перед командами изменения
+                await pipe.set(key, new_state_obj.model_dump_json())
+                await pipe.execute()  # Попытка выполнить транзакцию
+
+                logger.debug(f"Состояние шаттла {shuttle_id} обновлено в Redis: {new_state_obj}")
+                return new_state_obj  # Успех, выходим из цикла
+            except redis.WatchError:
+                logger.warning(
+                    f"Конфликт записи (WatchError) при обновлении состояния шаттла {shuttle_id}. Повторная попытка.")
+                # Ключ был изменен другой транзакцией, продолжаем цикл для повторной попытки
+                continue  # Повторяем операцию WATCH и GET
+            except Exception as e:
+                logger.error(
+                    f"Ошибка при обновлении состояния шаттла {shuttle_id} в Redis: {e}. Данные: {updated_data if 'updated_data' in locals() else 'N/A'}")
+                return current_state_obj if 'current_state_obj' in locals() else None  # Возвращаем старое состояние или None
+
+
+async def get_all_shuttle_states_crud() -> Dict[str, ShuttleState]:  # Переименовал
+    r_crud = get_redis_client()
+    keys = []
+    async for key_bytes in r_crud.scan_iter(match=f"{SHUTTLE_STATE_PREFIX}*"):
+        keys.append(key_bytes)  # scan_iter возвращает байты
+
+    states = {}
+    if keys:
+        for key_str in keys:
+            state_json = await r_crud.get(key_str)
+            if state_json:
+                try:
+                    shuttle_id = key_str.replace(SHUTTLE_STATE_PREFIX, "")
+                    states[shuttle_id] = ShuttleState.model_validate_json(state_json)
+                except Exception as e:
+                    logger.error(f"Ошибка десериализации состояния для ключа {key_str}: {e}")
+    return states
+
+# initial_config.yaml
+shuttles_config:
+  virtual_shuttle_1:
+    host: "127.0.0.1"
+    command_port: 2000
+  shuttle_2:
+    host: "10.10.10.12"
+    command_port: 2000
+stock_to_shuttle:
+  Главный:
+    - virtual_shuttle_1
+  Второй склад:
+    - shuttle_2
+
+# main.py
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
+
+from core.config import settings
+from core.logging_config import setup_logging, logger
+from api.endpoints import router as api_router
+from services.shuttle_comms import start_shuttle_listener_server
+from core.redis_client import init_redis_pool, close_redis_pool
+from crud.shuttle_crud import init_shuttle_states_redis
+from services.command_processor import command_processor_worker, initialize_shuttle_locks
+
+setup_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Запуск шлюза WMS-Шаттл (Версия 2.0)...")
+    await settings.load_config()
+    # Инициализация Redis
+    await init_redis_pool()
+    await initialize_shuttle_locks()
+     # Загружаем конфигурацию из Redis
+    await init_shuttle_states_redis()
+    logger.info("Redis инициализирован, состояния шаттлов и конфигурация загружены.")
+
+    # Запуск TCP сервера для шаттлов
+    asyncio.create_task(start_shuttle_listener_server())
+    logger.info("TCP сервер для шаттлов запущен на порту 8181.")
+
+    # Запуск воркеров для обработки команд
+    command_processor_tasks = []
+    for i in range(settings.COMMAND_PROCESSOR_WORKERS):
+        task = asyncio.create_task(command_processor_worker(worker_id=i + 1))
+        command_processor_tasks.append(task)
+    logger.info(f"{settings.COMMAND_PROCESSOR_WORKERS} воркеров обработки команд запущены.")
+
+    yield
+
+    # Остановка шлюза
+    logger.info("Остановка шлюза WMS-Шаттл (Версия 2.0)...")
+    for task in command_processor_tasks:
+        task.cancel()
+    try:
+        await asyncio.gather(*command_processor_tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        logger.info("Задачи воркеров были отменены.")
+    logger.info("Воркеры обработки команд остановлены.")
+    await close_redis_pool()
+    logger.info("Соединение с Redis закрыто.")
+
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan
+)
+
+# Настройка Prometheus для мониторинга
+Instrumentator(
+    should_instrument_requests_inprogress=True,
+    excluded_handlers=["/metrics"]
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False, should_gzip=True)
+
+# Подключение маршрутов API
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+
+@app.get("/", summary="Health Check", include_in_schema=False)
+async def root():
+    return {"message": f"{settings.PROJECT_NAME} активен"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=settings.GATEWAY_HOST, port=settings.GATEWAY_PORT, log_level=settings.LOG_LEVEL.lower())
+
+
+# models/__init__.py
+
+
+# models/shuttle.py
+import time  # Добавил импорт
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class ShuttleCommand(str, Enum):
+    PALLET_IN = "PALLET_IN"
+    PALLET_OUT = "PALLET_OUT"
+    FIFO_NNN = "FIFO"
+    FILO_NNN = "FILO"
+    STACK_IN = "STACK_IN"
+    STACK_OUT = "STACK_OUT"
+    HOME = "HOME"
+    COUNT = "COUNT"
+    STATUS = "STATUS"
+    BATTERY = "BATTERY"
+    WDH = "WDH"
+    WLH = "WLH"
+    MRCD = "MRCD"
+
+
+class ShuttleMessage(str, Enum): # Не используется напрямую в коде, но полезно для понимания
+    PALLET_IN_STARTED = "PALLET_IN_STARTED"
+    PALLET_IN_DONE = "PALLET_IN_DONE"
+    # ... (остальные сообщения, как в предыдущем примере) ...
+
+
+class ShuttleOperationalStatus(str, Enum):
+    FREE = "FREE"
+    BUSY = "BUSY"
+    ERROR = "ERROR"
+    NOT_READY = "NOT_READY"
+    AWAITING_MRCD = "AWAITING_MRCD"
+    UNKNOWN = "UNKNOWN"
+
+
+class ShuttleState(BaseModel):
+    shuttle_id: str
+    status: ShuttleOperationalStatus = ShuttleOperationalStatus.UNKNOWN
+    current_command: Optional[str] = None
+    last_message_sent_to_wms: Optional[str] = None
+    last_message_received_from_wms: Optional[str] = None
+    battery_level: Optional[str] = None
+    location_data: Optional[str] = None
+    pallet_count_data: Optional[str] = None
+    wdh_hours: Optional[int] = None
+    wlh_hours: Optional[int] = None
+    error_code: Optional[str] = None
+    last_seen: float = Field(default_factory=time.time)
+    externaIID: Optional[str] = None  # Новое поле для externaIID
+    # writer: Optional[asyncio.StreamWriter] = None # Убрал, т.к. не хранится в Redis и управляется локально
+
+    class Config:
+        arbitrary_types_allowed = True
+
+# models/wms.py
+from pydantic import BaseModel
+from typing import List, Optional
+from models.shuttle import ShuttleCommand
+
+
+class PlacementLine(BaseModel):
+    externaIID: str
+    ShuttleIN: ShuttleCommand
+    params: Optional[str] = None  # Добавлено для гибкости, если параметры появятся позже
+
+
+class Placement(BaseModel):
+    externaIID: str
+    number: str
+    document: str
+    nameStockERP: str
+    placementLine: List[PlacementLine]
+
+
+class WMSCommandPayload(BaseModel):
+    placement: List[Placement]
+
+# project_dump.py
+import os
+from pathlib import Path
+
+
+def is_hidden(path):
+    """Проверяет, является ли путь скрытым (для Unix и Windows)"""
+    return any(part.startswith('.') for part in Path(path).parts if part != '.')
+
+
+def should_ignore(path):
+    """Определяет, нужно ли игнорировать папку/файл"""
+    ignore_dirs = {
+        '__pycache__', '.git', '.idea', '.venv',
+        'venv', 'env', 'node_modules', 'dist', 'build'
+    }
+    path_parts = Path(path).parts
+
+    # Игнорировать стандартные технические папки
+    if any(part in ignore_dirs for part in path_parts):
+        return True
+
+    # Игнорировать скрытые папки, кроме .env
+    if is_hidden(path) and not path.endswith('.env'):
+        return True
+
+    return False
+
+
+def collect_files(root_dir):
+    """Рекурсивно собирает список файлов проекта"""
+    project_files = []
+
+    for root, dirs, files in os.walk(root_dir):
+        # Удаляем игнорируемые папки из списка для обхода
+        dirs[:] = [d for d in dirs if not should_ignore(os.path.join(root, d))]
+
+        for file in files:
+            file_path = os.path.join(root, file)
+            if not should_ignore(file_path):
+                project_files.append(file_path)
+
+    return sorted(project_files)
+
+
+def write_project_structure(output_file, files):
+    """Записывает структуру проекта в файл"""
+    with open(output_file, 'w', encoding='utf-8') as f_out:
+        for file_path in files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f_in:
+                    content = f_in.read()
+            except UnicodeDecodeError:
+                continue  # Пропускаем бинарные файлы
+            except Exception as e:
+                content = f"# Error reading file: {str(e)}"
+
+            relative_path = os.path.relpath(file_path)
+            f_out.write(f"# {relative_path}\n")
+            f_out.write(f"{content}\n\n")
+
+
+if __name__ == "__main__":
+    project_root = os.getcwd()  # Текущая директория как корень проекта
+    output_filename = "project_dump.txt"
+
+    files = collect_files(project_root)
+    write_project_structure(output_filename, files)
+
+    print(f"Project structure saved to {output_filename}")
+    print(f"Total files processed: {len(files)}")
+
+# project_dump.txt
+# .env
+PROJECT_NAME=Stelkon WMS-Shuttle Gateway
+API_V1_STR=/api/v1
+GATEWAY_HOST=0.0.0.0
+GATEWAY_PORT=8000
+SHUTTLE_LISTENER_PORT=8181
+TCP_CONNECT_TIMEOUT=5.0
+TCP_READ_TIMEOUT=20.0
+TCP_WRITE_TIMEOUT=5.0
+LOG_LEVEL=INFO
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+COMMAND_QUEUE_MAX_SIZE=1000
+COMMAND_PROCESSOR_WORKERS=3
+WMS_WEBHOOK_URL=
+
+# api/__init__.py
+
+
+# api/endpoints.py
+from pprint import pprint
+from typing import Dict, Optional
+
+import yaml
+from fastapi import APIRouter, HTTPException, status
+from icecream import ic
+
+from core.config import settings
+from core.logging_config import logger
+from crud.shuttle_crud import get_shuttle_state_crud
+from models.shuttle import ShuttleCommand
+from models.wms import WMSCommandPayload
+from services.command_processor import add_command_to_queue
+from services.services import COMMANDS_SENT_TOTAL
+
+router = APIRouter()
+
+ALLOWED_WHEN_BUSY_COMMANDS = {
+    ShuttleCommand.MRCD,
+    ShuttleCommand.STATUS,
+    ShuttleCommand.HOME, # <-- Add HOME here
+}
+
+
+# Функция для поиска свободного шаттла
+async def get_free_shuttle(stock_name: str, command: str) -> str | None:
+    shuttles = settings.STOCK_TO_SHUTTLE.get(stock_name, [])
+    ic(shuttles)
+    for shuttle_id in shuttles:
+        state = await get_shuttle_state_crud(shuttle_id)
+        if command in ALLOWED_WHEN_BUSY_COMMANDS:
+            return shuttle_id
+        if state and state.status == "FREE":
+            return shuttle_id
+    return None
+
+
+@router.post("/command", summary="Send commands to shuttles")
+async def send_command(payload: WMSCommandPayload):
+    """
+    Send commands to shuttles based on WMS placement data.
+    """
+    queued_commands = []
+    for placement in payload.placement:
+        stock_name = placement.nameStockERP
+        for line in placement.placementLine:
+            command = line.ShuttleIN
+            ic(command)
+            shuttle_id = await get_free_shuttle(stock_name, command)
+            if not shuttle_id:
+                raise HTTPException(status_code=503, detail=f"Нет свободных шаттлов для склада {stock_name}")
+
+            if shuttle_id not in settings.SHUTTLES_CONFIG:
+                logger.error(f"Shuttle not found: {shuttle_id}")
+                raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+
+
+            success = await add_command_to_queue(
+                shuttle_id=ic(shuttle_id),
+                command=command,
+                params=line.params,
+                externaIID=line.externaIID,
+                priority=5 if command == "HOME" else 10
+            )
+            if not success:
+                logger.error(f"Failed to queue command {command.value} for {shuttle_id}: Queue full")
+                COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value,
+                                           status="failure_queue_full").inc()
+                raise HTTPException(status_code=503, detail="Command queue is full")
+            queued_commands.append({"shuttle_id": shuttle_id, "command": command.value})
+
+    logger.info(f"Queued commands: {queued_commands}")
+    return {"status": "queued", "commands": queued_commands}
+
+
+@router.get("/shuttle/{shuttle_id}/status", summary="Get status of a specific shuttle")
+async def get_status(shuttle_id: str) -> Dict[str, Optional[str]]:
+    """
+    Get status of a specific shuttle.
+    - **shuttle_id**: ID of the shuttle (e.g., virtual_shuttle_1)
+    """
+    if shuttle_id not in settings.SHUTTLES_CONFIG:
+        logger.error(f"Invalid shuttle_id: {shuttle_id}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shuttle {shuttle_id} not found")
+    shuttle_state = await get_shuttle_state_crud(shuttle_id)
+    response_model = shuttle_state.model_dump(mode="json")
+    response = {
+        **response_model,
+        "wlh_hours": str(response_model["wlh_hours"]),
+        "last_seen": str(response_model["last_seen"]),
+    }
+    pprint(response_model)
+    if shuttle_state is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shuttle {shuttle_id} not found")
+    return response
+
+
+@router.post("/shuttle/{shuttle_id}/move-to-stock", summary="Move shuttle to a new stock")
+async def move_shuttle_to_stock(shuttle_id: str, new_stock: str):
+    """
+    Move a shuttle to a new stock and update configuration in Redis.
+    - **shuttle_id**: ID of the shuttle (e.g., virtual_shuttle_1)
+    - **new_stock**: Name of the new stock (e.g., "Второй склад")
+    """
+    if shuttle_id not in settings.SHUTTLES_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
+    await settings.update_shuttle_stock(shuttle_id, new_stock)
+    logger.info(f"Shuttle {shuttle_id} moved to stock {new_stock}")
+
+    with open("initial_config.yaml", "r") as f:
+        config_data = yaml.safe_load(f)
+    for stock, shuttles in config_data["stock_to_shuttle"].items():
+        if shuttle_id in shuttles:
+            shuttles.remove(shuttle_id)
+            break
+    if new_stock not in config_data["stock_to_shuttle"]:
+        config_data["stock_to_shuttle"][new_stock] = []
+    config_data["stock_to_shuttle"][new_stock].append(shuttle_id)
+    with open("initial_config.yaml", "w") as f:
+        yaml.dump(config_data, f)
+    return {"status": "success", "shuttle_id": shuttle_id, "new_stock": new_stock}
+
+# core/__init__.py
+
+
+# core/config.py
+import os
+from pprint import pprint
+from typing import Dict, Optional
+
+import yaml
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field
+import redis.asyncio as redis
+import json
+
+
+class ShuttleNetworkConfig(BaseModel):
+    host: str
+    command_port: int = 2000
+
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = os.getenv('PROJECT_NAME', 'shuttle')
+    API_V1_STR: str = os.getenv('API_V1_STR', '/api/v1')
+    GATEWAY_HOST: str = os.getenv('GATEWAY_HOST', 'localhost')
+    GATEWAY_PORT: int = int(os.getenv('GATEWAY_PORT', '8000'))
+    SHUTTLE_LISTENER_PORT: int = int(os.getenv('SHUTTLE_LISTENER_PORT', '5000'))
+    TCP_CONNECT_TIMEOUT: float = float(os.getenv('TCP_CONNECT_TIMEOUT', '5.0'))
+    TCP_READ_TIMEOUT: float = float(os.getenv('TCP_READ_TIMEOUT', '20.0'))
+    TCP_WRITE_TIMEOUT: float = float(os.getenv('TCP_WRITE_TIMEOUT', '5.0'))
+    LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
+    REDIS_HOST: str = os.getenv('REDIS_HOST', 'localhost')
+    REDIS_PORT: int = int(os.getenv('REDIS_PORT', '6379'))
+    REDIS_DB: int = int(os.getenv('REDIS_DB', '0'))
+    REDIS_PASSWORD: Optional[str] = os.getenv('REDIS_PASSWORD', None)
+    COMMAND_QUEUE_MAX_SIZE: int = int(os.getenv('COMMAND_QUEUE_MAX_SIZE', '1000'))
+    COMMAND_PROCESSOR_WORKERS: int = int(os.getenv('COMMAND_PROCESSOR_WORKERS', '1'))
+    WMS_WEBHOOK_URL: str = os.getenv('WMS_WEBHOOK_URL', '')
+    SHUTTLES_CONFIG: Dict[str, ShuttleNetworkConfig] = {}
+    STOCK_TO_SHUTTLE: Dict[str, list[str]] = {}
+
+    redis_client: Optional[redis.Redis] = Field(default=None, exclude=True)
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra='ignore')
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.redis_client = redis.Redis(
+            host=self.REDIS_HOST,
+            port=self.REDIS_PORT,
+            db=self.REDIS_DB,
+            password=self.REDIS_PASSWORD,
+            decode_responses=True
+        )
+
+    async def load_config(self):
+        """Загружает конфигурацию из Redis."""
+        shuttles_data = await self.redis_client.get("shuttles_config")
+        stock_data = await self.redis_client.get("stock_to_shuttle")
+        with open("initial_config.yaml", "r") as f:
+            config_data = yaml.safe_load(f)
+        pprint(config_data)
+        if shuttles_data:
+            self.SHUTTLES_CONFIG = {
+                k: ShuttleNetworkConfig(**v) for k, v in json.loads(shuttles_data).items()
+            }
+        else:
+            self.SHUTTLES_CONFIG = {
+                k: ShuttleNetworkConfig(**v)
+                for k, v in config_data["shuttles_config"].items()
+            }
+            await self.save_config()  # Сохраняем в Redis
+
+        if stock_data:
+            self.STOCK_TO_SHUTTLE = json.loads(stock_data)
+        else:
+            self.STOCK_TO_SHUTTLE = config_data["stock_to_shuttle"]
+            await self.save_config()
+        pprint(self.SHUTTLES_CONFIG)
+        pprint(self.STOCK_TO_SHUTTLE)
+
+
+    async def save_config(self):
+        """Сохраняет конфигурацию в Redis."""
+        await self.redis_client.set(
+            "shuttles_config",
+            json.dumps({k: v.dict() for k, v in self.SHUTTLES_CONFIG.items()})
+        )
+        await self.redis_client.set("stock_to_shuttle", json.dumps(self.STOCK_TO_SHUTTLE))
+
+    async def update_shuttle_stock(self, shuttle_id: str, new_stock: str):
+        """Перемещает шаттл на новый склад и обновляет конфигурацию."""
+        for stock, shuttles in self.STOCK_TO_SHUTTLE.items():
+            if shuttle_id in shuttles:
+                shuttles.remove(shuttle_id)
+        if new_stock not in self.STOCK_TO_SHUTTLE:
+            self.STOCK_TO_SHUTTLE[new_stock] = []
+        self.STOCK_TO_SHUTTLE[new_stock].append(shuttle_id)
+        await self.save_config()
+
+
+settings = Settings()
+
+# core/logging_config.py
+import logging
+import sys
+from core.config import settings # Уже импортировано выше, если это один файл
+
+def setup_logging():
+    logging.basicConfig(
+        level=settings.LOG_LEVEL.upper(),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    # Уменьшаем "болтливость" некоторых библиотек
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("redis").setLevel(logging.INFO)
+
+
+logger = logging.getLogger(settings.PROJECT_NAME)
+
+
+# core/redis_client.py
+from typing import Optional
+import redis.asyncio as redis
+from core.config import settings
+from core.logging_config import logger
+
+redis_client_instance: Optional[redis.Redis] = None
+
+
+async def init_redis_pool():
+
+    global redis_client_instance
+    try:
+        redis_client_instance = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            password=settings.REDIS_PASSWORD,
+            decode_responses=True
+        )
+        await redis_client_instance.ping()
+        logger.info("Успешное подключение к Redis.")
+    except Exception as e:
+        logger.error(f"Не удалось подключиться к Redis: {e}")
+        redis_client_instance = None
+
+async def close_redis_pool():
+    from core import logger
+    if redis_client_instance:
+        await redis_client_instance.close()
+        logger.info("Соединение с Redis закрыто.")
+
+def get_redis_client() -> redis.Redis:
+    if not redis_client_instance:
+        raise ConnectionError("Клиент Redis не инициализирован или соединение потеряно.")
+    return redis_client_instance
+
+
+# crud/__init__.py
+
+
+# crud/shuttle_crud.py
+import json
+
+import time # Уже импортировано
+from pprint import pprint
+from typing import Dict, Optional, List # Уже импортировано
+
+from icecream import ic
+
+from models.shuttle import ShuttleState, ShuttleOperationalStatus # Уже импортировано
+from core.config import settings # Уже импортировано
+from core.logging_config import logger # Уже импортировано
+from core.redis_client import get_redis_client # Уже импортировано
+import redis.asyncio as redis # Уже импортировано
+
+SHUTTLE_STATE_PREFIX = "shuttle_state:"
+
+
+async def _get_shuttle_key(shuttle_id: str) -> str:
+    return f"{SHUTTLE_STATE_PREFIX}{shuttle_id}"
+
+
+async def init_shuttle_states_redis():
+    r_crud = get_redis_client()  # Используем локальную переменную, чтобы не путать с импортом
+    for shuttle_id in settings.SHUTTLES_CONFIG.keys():
+        key = await _get_shuttle_key(shuttle_id)
+        if not await r_crud.exists(key):
+            initial_state = ShuttleState(shuttle_id=shuttle_id)
+            await r_crud.set(key, initial_state.model_dump_json())
+            logger.info(f"Инициализировано состояние для шаттла {shuttle_id} в Redis.")
+
+
+async def get_shuttle_state_crud(shuttle_id: str) -> Optional[ShuttleState]:  # Переименовал во избежание конфликта
+    r_crud = get_redis_client()
+    key = await _get_shuttle_key(shuttle_id)
+    state_json = await r_crud.get(key)
+    ic(state_json)
+    if state_json:
+        return ShuttleState.model_validate_json(state_json)
+    return None
+
+
+async def update_shuttle_state_crud(shuttle_id: str, updates: Dict) -> Optional[ShuttleState]:  # Переименовал
+    r_crud = get_redis_client()
+    key = await _get_shuttle_key(shuttle_id)
+
+    # Оптимистическая блокировка с использованием WATCH
+    async with r_crud.pipeline(transaction=True) as pipe:
+        while True:  # Цикл для повторной попытки в случае WatchError
+            try:
+                await pipe.watch(key)
+                current_state_json = await pipe.get(key)
+
+                if not current_state_json:
+                    logger.warning(f"Попытка обновить состояние несуществующего шаттла {shuttle_id} в Redis.")
+                    # Можно создать, если нужно:
+                    # current_state_obj = ShuttleState(shuttle_id=shuttle_id, **updates)
+                    # current_state_obj.last_seen = time.time()
+                    # pipe.multi() # Начать транзакцию
+                    # await pipe.set(key, current_state_obj.model_dump_json())
+                    # await pipe.execute()
+                    # return current_state_obj
+                    return None
+
+                current_state_obj = ShuttleState.model_validate_json(current_state_json)
+
+                updated_data = current_state_obj.model_dump()
+                updated_data.update(updates)
+                updated_data["last_seen"] = time.time()
+
+                # writer не хранится в Redis
+                updated_data.pop("writer", None)
+
+                new_state_obj = ShuttleState(**updated_data)
+                pipe.multi()  # Начать транзакцию перед командами изменения
+                await pipe.set(key, new_state_obj.model_dump_json())
+                await pipe.execute()  # Попытка выполнить транзакцию
+
+                logger.debug(f"Состояние шаттла {shuttle_id} обновлено в Redis: {new_state_obj}")
+                return new_state_obj  # Успех, выходим из цикла
+            except redis.WatchError:
+                logger.warning(
+                    f"Конфликт записи (WatchError) при обновлении состояния шаттла {shuttle_id}. Повторная попытка.")
+                # Ключ был изменен другой транзакцией, продолжаем цикл для повторной попытки
+                continue  # Повторяем операцию WATCH и GET
+            except Exception as e:
+                logger.error(
+                    f"Ошибка при обновлении состояния шаттла {shuttle_id} в Redis: {e}. Данные: {updated_data if 'updated_data' in locals() else 'N/A'}")
+                return current_state_obj if 'current_state_obj' in locals() else None  # Возвращаем старое состояние или None
+
+
+async def get_all_shuttle_states_crud() -> Dict[str, ShuttleState]:  # Переименовал
+    r_crud = get_redis_client()
+    keys = []
+    async for key_bytes in r_crud.scan_iter(match=f"{SHUTTLE_STATE_PREFIX}*"):
+        keys.append(key_bytes)  # scan_iter возвращает байты
+
+    states = {}
+    if keys:
+        for key_str in keys:
+            state_json = await r_crud.get(key_str)
+            if state_json:
+                try:
+                    shuttle_id = key_str.replace(SHUTTLE_STATE_PREFIX, "")
+                    states[shuttle_id] = ShuttleState.model_validate_json(state_json)
+                except Exception as e:
+                    logger.error(f"Ошибка десериализации состояния для ключа {key_str}: {e}")
+    return states
+
+# initial_config.yaml
+shuttles_config:
+  virtual_shuttle_1:
+    host: "127.0.0.1"
+    command_port: 2000
+  shuttle_2:
+    host: "10.10.10.12"
+    command_port: 2000
+stock_to_shuttle:
+  Главный:
+    - virtual_shuttle_1
+  Второй склад:
+    - shuttle_2
+
+# main.py
+
+
+# requirements.txt
+annotated-types==0.7.0
+anyio==4.9.0
+click==8.1.8
+fastapi==0.115.12
+h11==0.16.0
+idna==3.10
+pip==23.2.1
+prometheus-client==0.21.1
+prometheus-fastapi-instrumentator==7.1.0
+pydantic==2.11.4
+pydantic-core==2.33.2
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+redis==6.0.0
+setuptools==68.2.0
+sniffio==1.3.1
+starlette==0.46.2
+typing-extensions==4.13.2
+typing-inspection==0.4.0
+uvicorn==0.34.2
+wheel==0.41.2
+
+
+# services/__init__.py
+
+
+# services/command_processor.py
+import asyncio
+import time
+from typing import Dict, Optional
+
+from icecream import ic
+
+from core.config import settings
+from core.logging_config import logger
+from crud.shuttle_crud import get_shuttle_state_crud, update_shuttle_state_crud
+from models.shuttle import ShuttleCommand, ShuttleOperationalStatus
+from services.services import COMMANDS_SENT_TOTAL, COMMAND_QUEUE_SIZE_METRIC
+from services.shuttle_comms import send_command_to_shuttle
+
+command_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=settings.COMMAND_QUEUE_MAX_SIZE)
+shuttle_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def initialize_shuttle_locks():
+    global shuttle_locks
+    shuttle_locks = {
+        shuttle_id: asyncio.Lock() for shuttle_id in settings.SHUTTLES_CONFIG.keys()
+    }
+    logger.info(f"Shuttle locks initialized: {list(shuttle_locks.keys())}")
+
+
+async def process_wms_command_internal(shuttle_id: str, command: ShuttleCommand, params: Optional[str] = None,
+                                       externaIID: Optional[str] = None) -> bool:
+    shuttle_state = await get_shuttle_state_crud(shuttle_id)
+    if not shuttle_state:
+        logger.error(f"Шаттл {shuttle_id} не найден для команды {command.value}.")
+        COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value, status="failure_not_found").inc()
+        return False
+
+    # Команда HOME всегда обрабатывается, т.к. это аварийная остановка
+    if command == ShuttleCommand.HOME:
+        logger.info(f"Команда HOME для {shuttle_id}. Прерываем текущую операцию, если есть.")
+        if shuttle_state.current_command:
+            logger.debug(f"Очистка текущей команды {shuttle_state.current_command} перед HOME")
+            await update_shuttle_state_crud(shuttle_id, {"current_command": None})
+    # Команда PALLET_OUT должна работать, даже если шаттл в BUSY состоянии с палетой (CARGO)
+    elif command == ShuttleCommand.PALLET_OUT:
+        # Проверяем, что если шаттл BUSY, то это из-за груза, а не из-за другой операции
+        if shuttle_state.status == ShuttleOperationalStatus.BUSY:
+            # Можно добавить дополнительную проверку, что сейчас выполняется команда PALLET_IN или есть палета
+            logger.info(f"Шаттл {shuttle_id} в состоянии BUSY, но разрешаем команду {command.value} для выгрузки")
+    # Проверка для остальных команд (кроме MRCD и STATUS)
+    elif command != ShuttleCommand.MRCD and command != ShuttleCommand.STATUS:
+        if shuttle_state.status not in [ShuttleOperationalStatus.FREE, ShuttleOperationalStatus.UNKNOWN]:
+            logger.warning(f"Шаттл {shuttle_id} в состоянии {shuttle_state.status}, команда {command.value} отклонена")
+            COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value, status="failure_busy").inc()
+            return False
+
+    command_str_to_send = command.value
+    param_for_shuttle = None
+    if command in [ShuttleCommand.FIFO_NNN, ShuttleCommand.FILO_NNN]:
+        if not params or not params.isdigit():
+            logger.error(f"Некорректный параметр для {command.value}: {params}")
+            COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value,
+                                       status="failure_bad_params").inc()
+            return False
+        param_for_shuttle = params
+
+    success = await send_command_to_shuttle(shuttle_id, command_str_to_send, param_for_shuttle)
+    metric_status = "success" if success else "failure_send_error"
+    COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value, status=metric_status).inc()
+
+    if success:
+        updates = {
+            "last_message_received_from_wms": command.value + (f"-{params}" if params else ""),
+            "last_seen": time.time(),
+            "externaIID": externaIID
+        }
+        if command != ShuttleCommand.MRCD:
+            updates["current_command"] = command.value + (f"-{params}" if params else "")
+        await update_shuttle_state_crud(shuttle_id, updates)
+        logger.debug(f"Состояние шаттла {shuttle_id} обновлено после команды {command.value}")
+    return success
+
+
+async def add_command_to_queue(shuttle_id: str, command: ShuttleCommand,
+                               params: Optional[str] = None, externaIID: Optional[str] = None, priority: int = 10):
+    data = {
+        "shuttle_id": shuttle_id,
+        "command": command,
+        "params": params,
+        "externaIID": externaIID  # Сохраняем externaIID в данных команды
+    }
+    try:
+        await command_queue.put((priority, data))
+        COMMAND_QUEUE_SIZE_METRIC.set(command_queue.qsize())
+        logger.info(f"Команда {command.value} для {shuttle_id} добавлена в очередь с приоритетом {priority}.")
+        return True
+    except asyncio.QueueFull:
+        logger.error(f"Очередь команд заполнена. Команда {command.value} для {shuttle_id} не добавлена.")
+        return False
+
+
+async def command_processor_worker(worker_id: int):
+    logger.info(f"Воркер обработки команд {worker_id} запущен.")
+    while True:
+        try:
+            priority, data = await command_queue.get()
+            COMMAND_QUEUE_SIZE_METRIC.set(command_queue.qsize())
+            ic(data)
+            shuttle_id = data["shuttle_id"]
+            command = data["command"]
+            params = data.get("params")
+            externaIID = data.get("externaIID")
+
+            shuttle_lock = shuttle_locks.get(shuttle_id)
+            if not shuttle_lock:
+                logger.error(f"Не найден лок для шаттла {shuttle_id}. Команда {command.value} пропущена.")
+                command_queue.task_done()
+                continue
+
+            logger.info(f"Воркер {worker_id} взял команду для шаттла {shuttle_id}: {command.value}")
+
+            async with shuttle_lock:
+                await process_wms_command_internal(
+                    shuttle_id=shuttle_id,
+                    command=command,
+                    params=params,
+                    externaIID=externaIID
+                )
+
+            command_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info(f"Воркер обработки команд {worker_id} останавливается.")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в воркере {worker_id}: {e}", exc_info=True)
+            if not command_queue.empty() and 'priority' in locals():
+                command_queue.task_done()
+
+
+# services/services.py
+from prometheus_client import Counter, Gauge, Histogram
+
+COMMANDS_SENT_TOTAL = Counter(
+    "gateway_commands_sent_total",
+    "Total number of commands sent to shuttles",
+    ["shuttle_id", "command_type", "status"]
+)
+SHUTTLE_MESSAGES_RECEIVED_TOTAL = Counter(
+    "gateway_shuttle_messages_received_total",
+    "Total number of messages received from shuttles",
+    ["shuttle_id", "message_type"]
+)
+SHUTTLE_ERRORS_TOTAL = Counter(
+    "gateway_shuttle_errors_total",
+    "Total number of F_CODE errors reported by shuttles",
+    ["shuttle_id", "f_code"]
+)
+ACTIVE_SHUTTLE_CONNECTIONS = Gauge(
+    "gateway_active_shuttle_connections",
+    "Number of active TCP connections from shuttles"
+)
+SHUTTLE_BATTERY_LEVEL = Gauge(
+    "gateway_shuttle_battery_level_percent",
+    "Last reported battery level of a shuttle",
+    ["shuttle_id"]
+)
+COMMAND_QUEUE_SIZE_METRIC = Gauge( # Переименовал, чтобы не конфликтовать с переменной очереди
+    "gateway_command_queue_size",
+    "Current size of the WMS command queue"
+)
+
+# services/shuttle_comms.py
+import asyncio
+import time
+from typing import Optional
+
+import aiohttp
+from attrs import define
+
+from core.config import settings
+from core.logging_config import logger
+from crud.shuttle_crud import update_shuttle_state_crud, get_shuttle_state_crud
+from models.shuttle import ShuttleOperationalStatus, ShuttleCommand
+from services.services import ACTIVE_SHUTTLE_CONNECTIONS, SHUTTLE_BATTERY_LEVEL, SHUTTLE_MESSAGES_RECEIVED_TOTAL, \
+    SHUTTLE_ERRORS_TOTAL
+
+
+@define(slots=True, frozen=True)
+class ConfigShuttle:
+    SHUTTLE_TIMEOUT_SECONDS: int = 30  # Таймаут для зависших шаттлов
+    WMS_WEBHOOK_URL: str = settings.WMS_WEBHOOK_URL
+
+
+conf = ConfigShuttle()
+
+
+async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optional[str] = None) -> bool:
+    shuttle_config = settings.SHUTTLES_CONFIG.get(shuttle_id)
+    if not shuttle_config:
+        logger.error(f"Конфигурация для шаттла {shuttle_id} не найдена.")
+        return False
+
+    full_command = command
+    if params:
+        full_command = f"{command}-{int(params):03}"
+
+    if not full_command.endswith('\n'):
+        full_command += '\n'
+
+    logger.info(
+        f"Отправка команды '{full_command.strip()}' шаттлу {shuttle_id} ({shuttle_config.host}:{shuttle_config.command_port})")
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(shuttle_config.host, shuttle_config.command_port),
+            timeout=settings.TCP_CONNECT_TIMEOUT
+        )
+
+        writer.write(full_command.encode('utf-8'))
+        await asyncio.wait_for(writer.drain(), timeout=settings.TCP_WRITE_TIMEOUT)
+        logger.info(f"Команда '{full_command.strip()}' успешно отправлена шаттлу {shuttle_id}")
+
+        writer.close()
+        await writer.wait_closed()
+        return True
+
+    except asyncio.TimeoutError:
+        logger.error(f"Таймаут при отправке команды шаттлу {shuttle_id} ({full_command.strip()})")
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "TCP_TIMEOUT_SEND"})
+    except ConnectionRefusedError:
+        logger.error(f"Соединение отклонено шаттлом {shuttle_id} ({shuttle_config.host}:{shuttle_config.command_port})")
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "CONNECTION_REFUSED"})
+    except OSError as e:
+        logger.error(f"Ошибка сети при отправке команды шаттлу {shuttle_id}: {e}")
+        await update_shuttle_state_crud(shuttle_id, {"status": ShuttleOperationalStatus.ERROR,
+                                                     "error_code": f"NET_ERROR_{e.errno}"})
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при отправке команды шаттлу {shuttle_id}: {e}")
+        await update_shuttle_state_crud(shuttle_id,
+                                        {"status": ShuttleOperationalStatus.ERROR, "error_code": "UNKNOWN_SEND_ERROR"})
+    return False
+
+
+async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_code: Optional[str] = None,
+                              externaIID: Optional[str] = None):
+    if not conf.WMS_WEBHOOK_URL or not conf.WMS_WEBHOOK_URL.strip():
+        logger.warning("WMS_WEBHOOK_URL не настроен или пуст. Пропуск отправки в WMS.")
+        return
+
+    payload = {
+        "shuttle_id": shuttle_id,
+        "message": message,
+        "status": status,
+        "error_code": error_code,
+        "externaIID": externaIID,  # externaIID is now passed correctly
+        "timestamp": time.time()
+    }
+    logger.debug(f"Отправка Webhook в WMS: {payload}")  # Added debug log for payload
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(conf.WMS_WEBHOOK_URL, json=payload) as response:
+                if response.status >= 200 and response.status < 300:  # Check for 2xx success codes
+                    logger.info(f"Успешно отправлено в WMS для {shuttle_id}: {message}")
+                else:
+                    logger.error(f"Ошибка отправки в WMS: {response.status} {await response.text()}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке Webhook в WMS: {e}, данные: {payload}")
+
+
+async def process_shuttle_message_internal(shuttle_id: str, message: str):
+    # Fetch current state to get externaIID associated with the command
+    # This externaIID was stored when the command was initially processed and sent.
+    current_state = await get_shuttle_state_crud(shuttle_id)
+    current_externaIID = current_state.externaIID if current_state else None
+
+    updates = {"last_message_sent_to_wms": message, "last_seen": time.time()}
+
+    if message.endswith("_STARTED"):
+        updates["status"] = ShuttleOperationalStatus.BUSY
+    elif message.endswith("_DONE") or message.endswith("_ABORT"):
+        updates["status"] = ShuttleOperationalStatus.FREE
+        updates["current_command"] = None  # Clear command when done/aborted
+        if message.endswith("_ABORT"):
+            updates["error_code"] = message
+            updates["status"] = ShuttleOperationalStatus.ERROR  # ABORT implies an error state transition
+
+    if message.startswith("LOCATION="):
+        updates["location_data"] = message.split("=", 1)[1]
+        updates["status"] = ShuttleOperationalStatus.FREE  # Location implies task done
+        updates["current_command"] = None
+    elif message.startswith("COUNT_") and "=" in message:
+        updates["pallet_count_data"] = message
+        updates["status"] = ShuttleOperationalStatus.FREE  # Count implies task done
+        updates["current_command"] = None
+    elif message.startswith("STATUS="):
+        status_val = message.split("=", 1)[1].upper()  # Ensure uppercase for matching
+        status_map = {
+            "FREE": ShuttleOperationalStatus.FREE,
+            "CARGO": ShuttleOperationalStatus.BUSY,  # Map CARGO to BUSY
+            "BUSY": ShuttleOperationalStatus.BUSY,
+            "NOT_READY": ShuttleOperationalStatus.NOT_READY
+        }
+        updates["status"] = status_map.get(status_val, ShuttleOperationalStatus.UNKNOWN)
+        # If STATUS message indicates FREE or NOT_READY, clear current command
+        if updates["status"] in [ShuttleOperationalStatus.FREE, ShuttleOperationalStatus.NOT_READY,
+                                 ShuttleOperationalStatus.UNKNOWN]:
+            updates["current_command"] = None  # Clear command if status indicates not busy
+    elif message.startswith("BATTERY="):
+        level_str = message.split("=", 1)[1]
+        updates["battery_level"] = level_str
+        try:
+            # Handle '<' prefix if present
+            parsed_level = float(level_str.replace('%', '').lstrip('<'))
+            SHUTTLE_BATTERY_LEVEL.labels(shuttle_id=shuttle_id).set(parsed_level)
+        except ValueError:
+            logger.warning(f"Не удалось распарсить уровень батареи: {level_str}")
+    elif message.startswith("WDH="):
+        try:
+            updates["wdh_hours"] = int(message.split("=", 1)[1])
+        except ValueError:
+            logger.warning(f"Не удалось распарсить WDH: {message}")
+    elif message.startswith("WLH="):
+        try:
+            updates["wlh_hours"] = int(message.split("=", 1)[1])
+        except ValueError:
+            logger.warning(f"Не удалось распарсить WLH: {message}")
+    elif message.startswith("F_CODE="):
+        updates["error_code"] = message
+        updates["status"] = ShuttleOperationalStatus.ERROR  # F_CODE indicates Error state
+        updates["current_command"] = None  # Clear command on error
+        SHUTTLE_ERRORS_TOTAL.labels(shuttle_id=shuttle_id, f_code=message).inc()
+
+    # Send webhook with the externaIID retrieved from the state
+    if conf.WMS_WEBHOOK_URL and conf.WMS_WEBHOOK_URL.strip():
+        asyncio.create_task(send_to_wms_webhook(
+            shuttle_id,
+            message,
+            updates.get("status", "UNKNOWN"),  # Use the potentially updated status
+            updates.get("error_code"),  # Use the potentially updated error code
+            current_externaIID  # Pass the externaIID from the state
+        ))
+
+    await update_shuttle_state_crud(shuttle_id, updates)
+    logger.debug(f"Обработано сообщение от {shuttle_id}: {message}, обновления: {updates}")
+
+
+async def handle_shuttle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    ACTIVE_SHUTTLE_CONNECTIONS.inc()
+    peername = writer.get_extra_info('peername')
+    shuttle_ip, shuttle_port = peername
+    logger.info(f"Шаттл подключился: {shuttle_ip}:{shuttle_port}")
+
+    shuttle_id = None
+    for sid, conf in settings.SHUTTLES_CONFIG.items():
+        if conf.host == shuttle_ip:
+            shuttle_id = sid
+            break
+
+    if not shuttle_id:
+        logger.warning(f"Неизвестный шаттл с {shuttle_ip}. Закрываем соединение.")
+        writer.close()
+        await writer.wait_closed()
+        ACTIVE_SHUTTLE_CONNECTIONS.dec()
+        return
+
+    try:
+        last_seen = time.time()
+        while True:
+            try:
+                data = await asyncio.wait_for(reader.readuntil(b'\n'), timeout=settings.TCP_READ_TIMEOUT)
+                message_str = data.decode('utf-8').strip()
+                logger.info(f"Получено сообщение от {shuttle_id} ({shuttle_ip}): '{message_str}'")
+
+                SHUTTLE_MESSAGES_RECEIVED_TOTAL.labels(shuttle_id=shuttle_id, message_type=message_str.split("=")[
+                    0] if "=" in message_str else message_str).inc()
+                try:
+                    await process_shuttle_message_internal(shuttle_id, message_str)
+                except Exception as e:
+                    if settings.DEBUG:
+                        logger.error(f"Ошибка при обработке сообщения от шаттла {shuttle_id}: {e}", exc_info=True)
+                    else:
+                        logger.error(f"Ошибка при обработке сообщения от шаттла {shuttle_id}: {e}")
+                last_seen = time.time()
+
+                if message_str.upper() != ShuttleCommand.MRCD.value:
+                    writer.write(f"{ShuttleCommand.MRCD.value}\n".encode('utf-8'))
+                    await asyncio.wait_for(writer.drain(), timeout=settings.TCP_WRITE_TIMEOUT)
+                    logger.info(f"Отправлен MRCD шаттлу {shuttle_id} для '{message_str}'")
+            except asyncio.TimeoutError:
+                current_time = time.time()
+                if current_time - last_seen > conf.SHUTTLE_TIMEOUT_SECONDS:
+                    logger.error(f"Шаттл {shuttle_id} не отвечает более {conf.SHUTTLE_TIMEOUT_SECONDS} секунд")
+                    await update_shuttle_state_crud(shuttle_id, {
+                        "status": ShuttleOperationalStatus.ERROR,
+                        "error_code": "TIMEOUT_NO_RESPONSE",
+                        "last_seen": current_time
+                    })
+                    break
+                continue
+            except asyncio.IncompleteReadError:
+                logger.warning(f"Шаттл {shuttle_id} закрыл соединение (IncompleteReadError)")
+                break
+    except Exception as e:
+        logger.error(f"Ошибка обработки шаттла {shuttle_id}: {e}", exc_info=True)
+    finally:
+        logger.info(f"Закрытие соединения с {shuttle_id} ({shuttle_ip})")
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        ACTIVE_SHUTTLE_CONNECTIONS.dec()
+
+
+async def start_shuttle_listener_server():
+    server = await asyncio.start_server(
+        handle_shuttle_client,
+        '0.0.0.0',
+        settings.SHUTTLE_LISTENER_PORT
+    )
+    addr = server.sockets[0].getsockname()
+    logger.info(f"Шлюз слушает шаттлы на {addr[0]}:{addr[1]}")
+    async with server:
+        await server.serve_forever()
+
+
