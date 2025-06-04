@@ -18,7 +18,7 @@ router = APIRouter()
 ALLOWED_WHEN_BUSY_COMMANDS = {
     ShuttleCommand.MRCD,
     ShuttleCommand.STATUS,
-    ShuttleCommand.HOME, # <-- Add HOME here
+    ShuttleCommand.HOME,  # <-- Add HOME here
 }
 
 
@@ -65,25 +65,33 @@ async def send_command(payload: WMSCommandPayload):
             ic(command)
             shuttle_id = await get_free_shuttle(stock_name, cell_id, command.value, externaIID)
             if not shuttle_id:
-                raise HTTPException(status_code=503, detail=f"Нет подходящих шаттлов для склада {stock_name}" + (f", ячейка {cell_id}" if cell_id else ""))
+                raise HTTPException(status_code=503, detail=f"Нет подходящих шаттлов для склада {stock_name}" + (
+                    f", ячейка {cell_id}" if cell_id else ""))
 
             if shuttle_id not in settings.SHUTTLES_CONFIG:
                 logger.error(f"Shuttle not found: {shuttle_id}")
                 raise HTTPException(status_code=404, detail=f"Shuttle {shuttle_id} not found")
 
-            success = await add_command_to_queue(
+            result = await add_command_to_queue(
                 shuttle_id=ic(shuttle_id),
                 command=command,
                 params=line.params,
                 externaIID=externaIID,
                 priority=5 if command == ShuttleCommand.HOME else 10
             )
-            if not success:
+            if not result:
                 logger.error(f"Failed to queue command {command.value} for {shuttle_id}: Queue full")
                 COMMANDS_SENT_TOTAL.labels(shuttle_id=shuttle_id, command_type=command.value,
                                            status="failure_queue_full").inc()
                 raise HTTPException(status_code=503, detail="Command queue is full")
-            queued_commands.append({"shuttle_id": shuttle_id, "command": command.value})
+
+            # Сохраняем ID команды для возможности отмены
+            command_id = result if isinstance(result, str) else None
+            queued_commands.append({
+                "shuttle_id": shuttle_id,
+                "command": command.value,
+                "command_id": command_id
+            })
 
     logger.info(f"Queued commands: {queued_commands}")
     return {"status": "queued", "commands": queued_commands}
@@ -135,3 +143,145 @@ async def move_shuttle_to_stock(shuttle_id: str, new_stock: str):
     with open("initial_config.yaml", "w") as f:
         yaml.dump(config_data, f)
     return {"status": "success", "shuttle_id": shuttle_id, "new_stock": new_stock}
+
+
+@router.delete("/command/{command_id}", summary="Cancel a queued command")
+async def cancel_command_endpoint(command_id: str):
+    """
+    Отменяет команду, если она еще не выполнена.
+    
+    Args:
+        command_id: ID команды для отмены
+    
+    Returns:
+        Статус операции отмены
+    """
+    from services.command_processor import cancel_command
+
+    success = await cancel_command(command_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Команда {command_id} не найдена или не может быть отменена")
+
+    return {"status": "cancelled", "command_id": command_id}
+
+
+@router.get("/wms/integration/status", summary="Get WMS integration status")
+async def get_wms_integration_status():
+    """
+    Получает статус интеграции с WMS API.
+    """
+    from services.wms_integration import wms_integration
+
+    status = {
+        "enabled": settings.WMS_INTEGRATION_ENABLED,
+        "running": wms_integration.running if settings.WMS_INTEGRATION_ENABLED else False,
+        "last_poll_time": wms_integration.last_poll_time.isoformat() if settings.WMS_INTEGRATION_ENABLED else None,
+        "poll_interval": settings.WMS_POLL_INTERVAL,
+        "processed_commands_count": len(wms_integration.processed_commands) if settings.WMS_INTEGRATION_ENABLED else 0
+    }
+
+    return status
+
+
+@router.post("/wms/integration/start", summary="Start WMS integration")
+async def start_wms_integration():
+    """
+    Запускает интеграцию с WMS API.
+    """
+    if not settings.WMS_INTEGRATION_ENABLED:
+        raise HTTPException(status_code=400, detail="WMS integration is disabled in settings")
+
+    from services.wms_integration import wms_integration
+
+    if wms_integration.running:
+        return {"status": "already_running"}
+
+    await wms_integration.start()
+    return {"status": "started"}
+
+
+@router.post("/wms/integration/stop", summary="Stop WMS integration")
+async def stop_wms_integration():
+    """
+    Останавливает интеграцию с WMS API.
+    """
+    if not settings.WMS_INTEGRATION_ENABLED:
+        raise HTTPException(status_code=400, detail="WMS integration is disabled in settings")
+
+    from services.wms_integration import wms_integration
+
+    if not wms_integration.running:
+        return {"status": "not_running"}
+
+    await wms_integration.stop()
+    return {"status": "stopped"}
+
+
+
+@router.post("/wms-mock/test-command", summary="Create test command for WMS integration")
+async def create_test_command(command_type: str = "shipment", shuttle_command: str = "PALLET_IN", stock_name: str = "Главный", cell_id: str = "", params: str = ""):
+    """
+    Создает тестовую команду для проверки интеграции с WMS.
+    
+    Args:
+        command_type: Тип команды (shipment или transfer)
+        shuttle_command: Команда для шаттла (PALLET_IN, PALLET_OUT, FIFO, FILO, HOME и т.д.)
+        stock_name: Название склада
+        cell_id: ID ячейки (опционально)
+        params: Параметры команды (опционально)
+    
+    Returns:
+        Информация о созданной команде
+    """
+    import aiohttp
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "http://localhost:8000/wms-mock/create-command",
+            params={
+                "command_type": command_type,
+                "shuttle_command": shuttle_command,
+                "stock_name": stock_name,
+                "cell_id": cell_id,
+                "params": params
+            }
+        ) as response:
+            if response.status == 200:
+                result = await response.json()
+                logger.info(f"Создана тестовая команда: {result}")
+                return {
+                    "status": "success",
+                    "message": "Тестовая команда создана",
+                    "command": {
+                        "type": command_type,
+                        "shuttle_command": shuttle_command,
+                        "stock_name": stock_name,
+                        "cell_id": cell_id,
+                        "params": params,
+                        "external_id": result.get("external_id")
+                    }
+                }
+            else:
+                error_text = await response.text()
+                logger.error(f"Ошибка при создании тестовой команды: {response.status}, {error_text}")
+                raise HTTPException(status_code=500, detail=f"Ошибка при создании тестовой команды: {error_text}")
+
+@router.post("/wms-integration/restart", summary="Restart WMS integration")
+async def restart_wms_integration():
+    """
+    Перезапускает интеграцию с WMS API.
+    """
+    if not settings.WMS_INTEGRATION_ENABLED:
+        raise HTTPException(status_code=400, detail="WMS integration is disabled in settings")
+    
+    from services.wms_integration import wms_integration
+    
+    # Останавливаем интеграцию
+    await wms_integration.stop()
+    logger.info("WMS интеграция остановлена для перезапуска")
+    
+    # Запускаем интеграцию заново
+    await wms_integration.start()
+    logger.info("WMS интеграция перезапущена")
+    
+    return {"status": "restarted"}

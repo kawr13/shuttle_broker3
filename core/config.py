@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     COMMAND_QUEUE_MAX_SIZE: int = int(os.getenv('COMMAND_QUEUE_MAX_SIZE', '1000'))
     COMMAND_PROCESSOR_WORKERS: int = int(os.getenv('COMMAND_PROCESSOR_WORKERS', '1'))
     WMS_WEBHOOK_URL: str = os.getenv('WMS_WEBHOOK_URL', '')
+    # Настройки для интеграции с WMS API
+    WMS_API_URL: str = os.getenv('WMS_API_URL', 'http://localhost:8080')
+    WMS_API_USERNAME: str = os.getenv('WMS_API_USERNAME', '')
+    WMS_API_PASSWORD: str = os.getenv('WMS_API_PASSWORD', '')
+    WMS_POLL_INTERVAL: int = int(os.getenv('WMS_POLL_INTERVAL', '60'))  # в секундах
+    WMS_INTEGRATION_ENABLED: bool = os.getenv('WMS_INTEGRATION_ENABLED', 'false').lower() == 'true'
     SHUTTLES_CONFIG: Dict[str, ShuttleNetworkConfig] = {}
     STOCK_TO_SHUTTLE: Dict[str, list[str]] = {}
 

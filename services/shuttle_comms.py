@@ -77,50 +77,93 @@ async def send_to_wms_webhook(shuttle_id: str, message: str, status: str, error_
         logger.warning("WMS_WEBHOOK_URL не настроен или пуст. Пропуск отправки в WMS.")
         return
 
+    # Улучшенная обработка externaIID
+    from services.command_processor import command_registry
+    
+    # Если externaIID не передан, пытаемся найти его в реестре команд
+    if not externaIID:
+        # Ищем активную команду для этого шаттла
+        for cmd_id, cmd_info in command_registry.items():
+            if cmd_info.get("shuttle_id") == shuttle_id and cmd_info.get("status") in ["queued", "processing"]:
+                externaIID = cmd_info.get("externaIID")
+                logger.debug(f"Найден externaIID {externaIID} для шаттла {shuttle_id} в реестре команд")
+                break
+
     payload = {
         "shuttle_id": shuttle_id,
         "message": message,
         "status": status,
         "error_code": error_code,
-        "externaIID": externaIID,  # externaIID is now passed correctly
+        "externaIID": externaIID,
         "timestamp": time.time()
     }
-    logger.debug(f"Отправка Webhook в WMS: {payload}")  # Added debug log for payload
+    logger.debug(f"Отправка Webhook в WMS: {payload}")
+    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(conf.WMS_WEBHOOK_URL, json=payload) as response:
+            async with session.post(conf.WMS_WEBHOOK_URL, json=payload, timeout=10) as response:
                 if response.status >= 200 and response.status < 300:  # Check for 2xx success codes
                     logger.info(f"Успешно отправлено в WMS для {shuttle_id}: {message}")
+                    response_text = await response.text()
+                    logger.debug(f"Ответ от WMS: {response_text}")
+                    return True
                 else:
                     logger.error(f"Ошибка отправки в WMS: {response.status} {await response.text()}")
+                    return False
+    except asyncio.TimeoutError:
+        logger.error(f"Таймаут при отправке webhook в WMS для {shuttle_id}")
+        return False
     except Exception as e:
         logger.error(f"Ошибка при отправке Webhook в WMS: {e}, данные: {payload}")
+        return False
 
 
 async def process_shuttle_message_internal(shuttle_id: str, message: str):
+    # Импортируем конечный автомат
+    from services.state_machine import shuttle_state_machine
+    
     # Fetch current state to get externaIID associated with the command
     # This externaIID was stored when the command was initially processed and sent.
     current_state = await get_shuttle_state_crud(shuttle_id)
     current_externaIID = current_state.externaIID if current_state else None
 
     updates = {"last_message_sent_to_wms": message, "last_seen": time.time()}
-
+    
+    # Определяем триггер для конечного автомата на основе сообщения
+    trigger = None
+    
     if message.endswith("_STARTED"):
-        updates["status"] = ShuttleOperationalStatus.BUSY
-    elif message.endswith("_DONE") or message.endswith("_ABORT"):
-        updates["status"] = ShuttleOperationalStatus.FREE
-        updates["current_command"] = None  # Clear command when done/aborted
-        if message.endswith("_ABORT"):
-            updates["error_code"] = message
-            updates["status"] = ShuttleOperationalStatus.ERROR  # ABORT implies an error state transition
+        # Определяем тип операции на основе сообщения
+        if "PALLET_IN" in message:
+            trigger = ShuttleCommand.PALLET_IN
+        elif "PALLET_OUT" in message:
+            trigger = ShuttleCommand.PALLET_OUT
+        elif "FIFO" in message:
+            trigger = ShuttleCommand.FIFO_NNN
+        elif "FILO" in message:
+            trigger = ShuttleCommand.FILO_NNN
+        elif "STACK_IN" in message:
+            trigger = ShuttleCommand.STACK_IN
+        elif "STACK_OUT" in message:
+            trigger = ShuttleCommand.STACK_OUT
+        elif "HOME" in message:
+            trigger = ShuttleCommand.HOME
+        else:
+            # Если не удалось определить конкретную операцию, используем общее состояние BUSY
+            updates["status"] = ShuttleOperationalStatus.BUSY
+    elif message.endswith("_DONE"):
+        trigger = "DONE"
+    elif message.endswith("_ABORT"):
+        updates["error_code"] = message
+        trigger = "ERROR"
 
     if message.startswith("LOCATION="):
         updates["location_data"] = message.split("=", 1)[1]
-        updates["status"] = ShuttleOperationalStatus.FREE  # Location implies task done
+        trigger = "DONE"  # Location implies task done
         updates["current_command"] = None
     elif message.startswith("COUNT_") and "=" in message:
         updates["pallet_count_data"] = message
-        updates["status"] = ShuttleOperationalStatus.FREE  # Count implies task done
+        trigger = "DONE"  # Count implies task done
         updates["current_command"] = None
     elif message.startswith("STATUS="):
         status_val = message.split("=", 1)[1].upper()  # Ensure uppercase for matching
@@ -128,7 +171,12 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
             "FREE": ShuttleOperationalStatus.FREE,
             "CARGO": ShuttleOperationalStatus.BUSY,  # Map CARGO to BUSY
             "BUSY": ShuttleOperationalStatus.BUSY,
-            "NOT_READY": ShuttleOperationalStatus.NOT_READY
+            "NOT_READY": ShuttleOperationalStatus.NOT_READY,
+            "MOVING": ShuttleOperationalStatus.MOVING,
+            "LOADING": ShuttleOperationalStatus.LOADING,
+            "UNLOADING": ShuttleOperationalStatus.UNLOADING,
+            "CHARGING": ShuttleOperationalStatus.CHARGING,
+            "LOW_BATTERY": ShuttleOperationalStatus.LOW_BATTERY
         }
         updates["status"] = status_map.get(status_val, ShuttleOperationalStatus.UNKNOWN)
         # If STATUS message indicates FREE or NOT_READY, clear current command
@@ -142,6 +190,10 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
             # Handle '<' prefix if present
             parsed_level = float(level_str.replace('%', '').lstrip('<'))
             SHUTTLE_BATTERY_LEVEL.labels(shuttle_id=shuttle_id).set(parsed_level)
+            
+            # Проверка низкого заряда батареи
+            if parsed_level < 20:  # Порог низкого заряда
+                trigger = "BATTERY_LOW"
         except ValueError:
             logger.warning(f"Не удалось распарсить уровень батареи: {level_str}")
     elif message.startswith("WDH="):
@@ -156,9 +208,21 @@ async def process_shuttle_message_internal(shuttle_id: str, message: str):
             logger.warning(f"Не удалось распарсить WLH: {message}")
     elif message.startswith("F_CODE="):
         updates["error_code"] = message
-        updates["status"] = ShuttleOperationalStatus.ERROR  # F_CODE indicates Error state
+        trigger = "ERROR"
         updates["current_command"] = None  # Clear command on error
         SHUTTLE_ERRORS_TOTAL.labels(shuttle_id=shuttle_id, f_code=message).inc()
+
+    # Применяем конечный автомат для определения нового состояния
+    if trigger and current_state:
+        new_state = await shuttle_state_machine.try_transition(
+            shuttle_id, 
+            current_state.status, 
+            trigger, 
+            {"message": message, "externaIID": current_externaIID}
+        )
+        if new_state:
+            updates["status"] = new_state
+            logger.info(f"Шаттл {shuttle_id}: переход в состояние {new_state} по триггеру {trigger}")
 
     # Send webhook with the externaIID retrieved from the state
     if conf.WMS_WEBHOOK_URL and conf.WMS_WEBHOOK_URL.strip():

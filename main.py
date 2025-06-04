@@ -11,6 +11,8 @@ from services.shuttle_comms import start_shuttle_listener_server
 from core.redis_client import init_redis_pool, close_redis_pool
 from crud.shuttle_crud import init_shuttle_states_redis
 from services.command_processor import command_processor_worker, initialize_shuttle_locks, initialize_shuttle_queues
+from services.wms_mock import mock_router
+
 
 setup_logging()
 
@@ -37,11 +39,34 @@ async def lifespan(app: FastAPI):
         task = asyncio.create_task(command_processor_worker(worker_id=i + 1))
         command_processor_tasks.append(task)
     logger.info(f"{settings.COMMAND_PROCESSOR_WORKERS} воркеров обработки команд запущены.")
+    
+    # Запуск мониторинга состояния шаттлов (heartbeat)
+    from services.heartbeat_monitor import heartbeat_monitor
+    await heartbeat_monitor.start()
+    logger.info("Мониторинг состояния шаттлов (heartbeat) запущен.")
+    
+    # Запуск интеграции с WMS API, если она включена
+    if settings.WMS_INTEGRATION_ENABLED:
+        from services.wms_integration import wms_integration
+        await wms_integration.start()
+        logger.info(f"Интеграция с WMS API запущена (интервал опроса: {settings.WMS_POLL_INTERVAL} сек)")
 
     yield
 
     # Остановка шлюза
     logger.info("Остановка шлюза WMS-Шаттл (Версия 2.0)...")
+    
+    # Остановка интеграции с WMS API
+    if settings.WMS_INTEGRATION_ENABLED:
+        from services.wms_integration import wms_integration
+        await wms_integration.stop()
+        logger.info("Интеграция с WMS API остановлена")
+    
+    # Остановка мониторинга состояния шаттлов
+    from services.heartbeat_monitor import heartbeat_monitor
+    await heartbeat_monitor.stop()
+    logger.info("Мониторинг состояния шаттлов остановлен.")
+    
     for task in command_processor_tasks:
         task.cancel()
     try:
@@ -67,6 +92,7 @@ Instrumentator(
 
 # Подключение маршрутов API
 app.include_router(api_router, prefix=settings.API_V1_STR)
+app.include_router(mock_router)
 
 
 @app.get("/", summary="Health Check", include_in_schema=False)

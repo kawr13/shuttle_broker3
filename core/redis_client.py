@@ -24,7 +24,7 @@ async def init_redis_pool():
         redis_client_instance = None
 
 async def close_redis_pool():
-    from core import logger
+    from core.logging_config import logger
     if redis_client_instance:
         await redis_client_instance.close()
         logger.info("Соединение с Redis закрыто.")
