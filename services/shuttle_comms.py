@@ -4,6 +4,7 @@ from typing import Optional
 
 import aiohttp
 from attrs import define
+from icecream import ic
 
 from core.config import settings
 from core.logging_config import logger
@@ -24,6 +25,7 @@ conf = ConfigShuttle()
 
 async def send_command_to_shuttle(shuttle_id: str, command: str, params: Optional[str] = None) -> bool:
     shuttle_config = settings.SHUTTLES_CONFIG.get(shuttle_id)
+    ic(shuttle_config)
     if not shuttle_config:
         logger.error(f"Конфигурация для шаттла {shuttle_id} не найдена.")
         return False
